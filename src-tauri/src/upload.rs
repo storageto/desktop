@@ -1,17 +1,31 @@
-use crate::storage::{add_to_history, get_api_url, get_visitor_token, set_visitor_token, UploadHistoryItem};
+use crate::storage::{add_to_history, get_api_url, get_visitor_token, UploadHistoryItem};
 use chrono::Utc;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_LENGTH, CONTENT_TYPE};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::error::Error;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 use tauri::ipc::Channel;
 use uuid::Uuid;
 
-const MULTIPART_THRESHOLD: u64 = 50 * 1024 * 1024; // 50MB
 const CHUNK_SIZE: u64 = 50 * 1024 * 1024; // 50MB chunks
+const BATCH_SIZE: usize = 250; // Max files per batch API call
+
+// Debug logging to file
+fn debug_log(msg: &str) {
+    let log_path = "/tmp/storageto_upload.log";
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    {
+        let timestamp = chrono::Local::now().format("%H:%M:%S%.3f");
+        let _ = writeln!(file, "[{}] {}", timestamp, msg);
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct UploadProgress {
@@ -21,6 +35,8 @@ pub struct UploadProgress {
     pub total_bytes: u64,
     pub percentage: f64,
     pub status: String,
+    pub collection_id: Option<String>,
+    pub collection_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +116,74 @@ struct ConfirmUploadRequest {
     collection_id: Option<String>,
 }
 
+// Batch upload structs
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchFileRequest {
+    pub filename: String,
+    pub content_type: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct InitBatchRequest {
+    files: Vec<BatchFileRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InitBatchResponse {
+    success: bool,
+    results: Option<std::collections::HashMap<String, InitBatchResult>>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct InitBatchResult {
+    pub upload_url: Option<String>,
+    pub r2_key: Option<String>,
+    #[serde(rename = "type")]
+    pub upload_type: Option<String>,
+    // Multipart fields (for large files)
+    pub upload_id: Option<String>,
+    pub initial_urls: Option<std::collections::HashMap<String, String>>,
+    // Error handling
+    pub success: Option<bool>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchConfirmFile {
+    pub filename: String,
+    pub size: u64,
+    pub content_type: String,
+    pub r2_key: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ConfirmBatchRequest {
+    collection_id: Option<String>,
+    files: Vec<BatchConfirmFile>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfirmBatchResponse {
+    success: bool,
+    results: Option<std::collections::HashMap<String, ConfirmBatchResult>>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ConfirmBatchResult {
+    pub success: bool,
+    pub file: Option<BatchConfirmedFile>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct BatchConfirmedFile {
+    pub id: String,
+    pub url: String,
+}
+
 #[derive(Debug, Serialize)]
 struct CompleteMultipartRequest {
     upload_id: String,
@@ -119,8 +203,9 @@ static HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
 fn get_client() -> &'static Client {
     HTTP_CLIENT.get_or_init(|| {
         Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .connect_timeout(std::time::Duration::from_secs(10))
+            // No overall timeout - uploads can take a long time
+            // Only set connect timeout
+            .connect_timeout(std::time::Duration::from_secs(30))
             .build()
             .unwrap_or_else(|_| Client::new())
     })
@@ -143,6 +228,115 @@ fn get_content_type(path: &Path) -> String {
     mime_guess::from_path(path)
         .first_or_octet_stream()
         .to_string()
+}
+
+/// Initialize multiple uploads in a single API call (max 250 files per batch)
+pub async fn init_batch(files: Vec<BatchFileRequest>) -> Result<std::collections::HashMap<String, InitBatchResult>, String> {
+    let client = get_client();
+    let api_url = get_api_url();
+
+    debug_log(&format!("[Batch] Initializing {} files via init-batch", files.len()));
+    debug_log(&format!("[Batch] API URL: {}/api/upload/init-batch", api_url));
+
+    let request = InitBatchRequest { files };
+
+    let response = client
+        .post(format!("{}/api/upload/init-batch", api_url))
+        .headers(get_headers())
+        .json(&request)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to init batch: {}", e))?;
+
+    debug_log(&format!("[Batch] Init response status: {}", response.status()));
+
+    if !response.status().is_success() {
+        let error_text = response.text().await.unwrap_or_default();
+        debug_log(&format!("[Batch] Init batch failed: {}", error_text));
+        return Err(format!("Init batch failed: {}", error_text));
+    }
+
+    let response_text = response.text().await.map_err(|e| format!("Failed to read response: {}", e))?;
+    debug_log(&format!("[Batch] Init response (first 500 chars): {}", &response_text[..response_text.len().min(500)]));
+
+    let data: InitBatchResponse = serde_json::from_str(&response_text)
+        .map_err(|e| format!("Failed to parse init-batch response: {}", e))?;
+
+    if !data.success {
+        return Err(data.error.unwrap_or_else(|| "Unknown error".to_string()));
+    }
+
+    let results = data.results.ok_or_else(|| "No results in init-batch response".to_string())?;
+
+    // Debug: log first result
+    if let Some((key, result)) = results.iter().next() {
+        debug_log(&format!("[Batch] First result key={}, upload_url={:?}, r2_key={:?}",
+            key,
+            result.upload_url.as_ref().map(|u| &u[..u.len().min(100)]),
+            result.r2_key));
+    }
+
+    Ok(results)
+}
+
+/// Confirm multiple uploads in a single API call (max 250 files per batch)
+pub async fn confirm_batch(
+    collection_id: Option<String>,
+    files: Vec<BatchConfirmFile>,
+) -> Result<std::collections::HashMap<String, ConfirmBatchResult>, String> {
+    let client = get_client();
+    let api_url = get_api_url();
+
+    debug_log(&format!("[Batch] Confirming {} files via confirm-batch", files.len()));
+
+    let request = ConfirmBatchRequest {
+        collection_id,
+        files,
+    };
+
+    let response = client
+        .post(format!("{}/api/upload/confirm-batch", api_url))
+        .headers(get_headers())
+        .json(&request)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to confirm batch: {}", e))?;
+
+    if !response.status().is_success() {
+        let error_text = response.text().await.unwrap_or_default();
+        debug_log(&format!("[Batch] Confirm batch failed: {}", error_text));
+        return Err(format!("Confirm batch failed: {}", error_text));
+    }
+
+    let data: ConfirmBatchResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse confirm-batch response: {}", e))?;
+
+    if !data.success {
+        return Err(data.error.unwrap_or_else(|| "Unknown error".to_string()));
+    }
+
+    data.results.ok_or_else(|| "No results in confirm-batch response".to_string())
+}
+
+/// Upload a single file directly to R2 using a presigned URL (no API calls, just R2)
+pub async fn upload_to_r2(
+    path: &Path,
+    upload_url: &str,
+    file_id: &str,
+    filename: &str,
+    size: u64,
+    on_progress: &Channel<UploadProgress>,
+    collection_id: Option<String>,
+    collection_name: Option<String>,
+) -> Result<(), String> {
+    upload_single(get_client(), upload_url, path, size, file_id, filename, on_progress, collection_id, collection_name).await
+}
+
+/// Get the BATCH_SIZE constant for external use
+pub fn get_batch_size() -> usize {
+    BATCH_SIZE
 }
 
 fn calculate_checksum(path: &Path) -> Result<String, String> {
@@ -187,13 +381,15 @@ pub async fn upload_file(
         total_bytes: size,
         percentage: 0.0,
         status: "initializing".to_string(),
+        collection_id: None,
+        collection_name: None,
     });
 
     let client = get_client();
     let api_url = get_api_url();
 
-    eprintln!("[Upload] Starting upload for: {} (size: {} bytes)", filename, size);
-    eprintln!("[Upload] API URL: {}", api_url);
+    debug_log(&format!("[Upload] Starting upload for: {} (size: {} bytes)", filename, size));
+    debug_log(&format!("[Upload] API URL: {}", api_url));
 
     // Step 1: Initialize upload
     let init_request = InitUploadRequest {
@@ -203,7 +399,7 @@ pub async fn upload_file(
         collection_id: collection_id.clone(),
     };
 
-    eprintln!("[Upload] Sending init request to {}/api/upload/init", api_url);
+    debug_log(&format!("[Upload] Sending init request to {}/api/upload/init", api_url));
 
     let init_response = client
         .post(format!("{}/api/upload/init", api_url))
@@ -212,33 +408,33 @@ pub async fn upload_file(
         .send()
         .await
         .map_err(|e| {
-            eprintln!("[Upload] Init request failed: {}", e);
+            debug_log(&format!("[Upload] Init request failed: {}", e));
             format!("Failed to initialize upload: {}", e)
         })?;
 
-    eprintln!("[Upload] Init response status: {}", init_response.status());
+    debug_log(&format!("[Upload] Init response status: {}", init_response.status()));
 
     if !init_response.status().is_success() {
         let error_text = init_response.text().await.unwrap_or_default();
-        eprintln!("[Upload] Init failed with error: {}", error_text);
+        debug_log(&format!("[Upload] Init failed with error: {}", error_text));
         return Err(format!("Upload init failed: {}", error_text));
     }
 
     let response_text = init_response.text().await.map_err(|e| format!("Failed to read response: {}", e))?;
-    eprintln!("[Upload] Init response body: {}", response_text);
+    debug_log(&format!("[Upload] Init response body: {}", response_text));
 
     let init_data: InitUploadResponse = serde_json::from_str(&response_text)
         .map_err(|e| {
-            eprintln!("[Upload] Failed to parse init response: {}", e);
+            debug_log(&format!("[Upload] Failed to parse init response: {}", e));
             format!("Failed to parse init response: {}", e)
         })?;
 
-    eprintln!("[Upload] Init response - success: {}, type: {:?}, r2_key: {:?}",
-        init_data.success, init_data.upload_type, init_data.r2_key);
+    debug_log(&format!("[Upload] Init response - success: {}, type: {:?}, r2_key: {:?}",
+        init_data.success, init_data.upload_type, init_data.r2_key));
 
     if !init_data.success {
         let error = init_data.error.unwrap_or_else(|| "Unknown error".to_string());
-        eprintln!("[Upload] Init failed: {}", error);
+        debug_log(&format!("[Upload] Init failed: {}", error));
         return Err(format!("Upload init failed: {}", error));
     }
 
@@ -253,6 +449,8 @@ pub async fn upload_file(
         total_bytes: size,
         percentage: 0.0,
         status: "uploading".to_string(),
+        collection_id: None,
+        collection_name: None,
     });
 
     if upload_type == "multipart" {
@@ -276,7 +474,7 @@ pub async fn upload_file(
     } else {
         // Single upload
         let upload_url = init_data.upload_url.ok_or("No upload_url in response")?;
-        upload_single(&client, &upload_url, path, size, &file_id, &filename, &on_progress).await?;
+        upload_single(&client, &upload_url, path, size, &file_id, &filename, &on_progress, None, None).await?;
     }
 
     // Step 3: Confirm upload
@@ -287,6 +485,8 @@ pub async fn upload_file(
         total_bytes: size,
         percentage: 100.0,
         status: "confirming".to_string(),
+        collection_id: None,
+        collection_name: None,
     });
 
     let confirm_request = ConfirmUploadRequest {
@@ -354,6 +554,8 @@ pub async fn upload_file(
         total_bytes: size,
         percentage: 100.0,
         status: "complete".to_string(),
+        collection_id: None,
+        collection_name: None,
     });
 
     Ok(UploadResult {
@@ -373,6 +575,8 @@ async fn upload_single(
     file_id: &str,
     filename: &str,
     on_progress: &Channel<UploadProgress>,
+    collection_id: Option<String>,
+    collection_name: Option<String>,
 ) -> Result<(), String> {
     use futures_util::stream::StreamExt;
     use tokio::io::AsyncReadExt;
@@ -387,6 +591,8 @@ async fn upload_single(
     let file_id = file_id.to_string();
     let filename = filename.to_string();
     let progress = on_progress.clone();
+    let coll_id = collection_id.clone();
+    let coll_name = collection_name.clone();
 
     // Create a stream that reports progress as chunks are read
     let chunk_size = 256 * 1024; // 256KB chunks
@@ -409,6 +615,8 @@ async fn upload_single(
                         total_bytes: size,
                         percentage,
                         status: "uploading".to_string(),
+                        collection_id: coll_id.clone(),
+                        collection_name: coll_name.clone(),
                     });
 
                     yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&buffer[..n]));
@@ -423,14 +631,28 @@ async fn upload_single(
 
     let body = reqwest::Body::wrap_stream(stream);
 
+    debug_log(&format!("[R2] PUT request to: {}...", &upload_url[..upload_url.len().min(80)]));
+    debug_log(&format!("[R2] Content-Type: {}, Content-Length: {}", content_type, size));
+
     let response = client
         .put(upload_url)
-        .header(CONTENT_TYPE, content_type)
+        .header(CONTENT_TYPE, content_type.clone())
         .header(CONTENT_LENGTH, size)
         .body(body)
         .send()
         .await
-        .map_err(|e| format!("Failed to upload file: {}", e))?;
+        .map_err(|e| {
+            debug_log(&format!("[R2] PUT failed: {:?}", e));
+            debug_log(&format!("[R2] Error kind: {:?}", e.status()));
+            debug_log(&format!("[R2] Is connect: {}, Is timeout: {}, Is request: {}",
+                e.is_connect(), e.is_timeout(), e.is_request()));
+            if let Some(source) = e.source() {
+                debug_log(&format!("[R2] Source error: {:?}", source));
+            }
+            format!("Failed to upload file: {}", e)
+        })?;
+
+    debug_log(&format!("[R2] PUT response status: {}", response.status()));
 
     if !response.status().is_success() {
         let error_text = response.text().await.unwrap_or_default();
@@ -520,6 +742,8 @@ async fn upload_multipart_v2(
             total_bytes: total_size,
             percentage,
             status: "uploading".to_string(),
+            collection_id: None,
+            collection_name: None,
         });
 
         part_number += 1;
@@ -672,8 +896,14 @@ pub async fn delete_file(file_id: String, is_collection: bool) -> Result<(), Str
         .await
         .map_err(|e| format!("Failed to delete: {}", e))?;
 
-    if !response.status().is_success() {
-        let status = response.status();
+    let status = response.status();
+
+    // Treat 404 as success - file is already gone, which is what we wanted
+    if status.as_u16() == 404 {
+        return Ok(());
+    }
+
+    if !status.is_success() {
         let error_text = response.text().await.unwrap_or_default();
         return Err(format!("Delete failed ({}): {}", status, error_text));
     }

@@ -18,6 +18,8 @@ interface UploadProgress {
   total_bytes: number;
   percentage: number;
   status: string;
+  collection_id?: string;
+  collection_name?: string;
 }
 
 interface UploadResult {
@@ -159,6 +161,8 @@ function App() {
         totalBytes: progress.total_bytes,
         percentage: progress.percentage,
         status: progress.status as UploadItem["status"],
+        collectionId: progress.collection_id,
+        collectionName: progress.collection_name,
       };
 
       const existing = prev.find((u) => u.id === progress.file_id);

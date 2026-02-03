@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from "react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { useFloating, offset, flip, shift, autoUpdate, FloatingPortal } from "@floating-ui/react";
 import { Tooltip } from "./Tooltip";
 
 export interface CollectionFile {
@@ -33,6 +34,8 @@ export interface UploadItem {
   status: "queued" | "initializing" | "uploading" | "confirming" | "complete" | "error";
   error?: string;
   url?: string;
+  collectionId?: string;
+  collectionName?: string;
 }
 
 interface HistoryProps {
@@ -242,6 +245,181 @@ function getStatusText(status: UploadItem["status"]): string {
   }
 }
 
+// Group uploads by collection
+interface CollectionUploadGroup {
+  collectionId: string;
+  collectionName: string;
+  files: UploadItem[];
+  totalBytes: number;
+  bytesUploaded: number;
+  percentage: number;
+  completedCount: number;
+  errorCount: number;
+  hasErrors: boolean;
+}
+
+function groupUploadsByCollection(uploads: UploadItem[]): {
+  collectionGroups: CollectionUploadGroup[];
+  standaloneUploads: UploadItem[];
+} {
+  const collectionMap = new Map<string, UploadItem[]>();
+  const standaloneUploads: UploadItem[] = [];
+
+  for (const upload of uploads) {
+    if (upload.collectionId && upload.collectionName) {
+      const existing = collectionMap.get(upload.collectionId) || [];
+      existing.push(upload);
+      collectionMap.set(upload.collectionId, existing);
+    } else {
+      standaloneUploads.push(upload);
+    }
+  }
+
+  const collectionGroups: CollectionUploadGroup[] = [];
+  for (const [collectionId, files] of collectionMap.entries()) {
+    const totalBytes = files.reduce((sum, f) => sum + f.totalBytes, 0);
+    const bytesUploaded = files.reduce((sum, f) => sum + f.bytesUploaded, 0);
+    const completedCount = files.filter(f => f.status === "complete" || f.status === "confirming").length;
+    const errorCount = files.filter(f => f.status === "error").length;
+
+    collectionGroups.push({
+      collectionId,
+      collectionName: files[0].collectionName || "Collection",
+      files,
+      totalBytes,
+      bytesUploaded,
+      percentage: totalBytes > 0 ? (bytesUploaded / totalBytes) * 100 : 0,
+      completedCount,
+      errorCount,
+      hasErrors: errorCount > 0,
+    });
+  }
+
+  return { collectionGroups, standaloneUploads };
+}
+
+// Collapsed collection upload component
+function CollectionUploadItem({ group }: { group: CollectionUploadGroup }) {
+  const [isExpanded, setIsExpanded] = useState(false);
+  const isComplete = group.completedCount === group.files.length;
+  const isUploading = group.files.some(f => f.status === "uploading" || f.status === "initializing" || f.status === "confirming");
+
+  return (
+    <div className="flex flex-col gap-1.5 py-2 px-2 rounded-lg bg-[#1c1917]/50">
+      {/* Collapsed header */}
+      <div
+        className="flex items-center gap-3 cursor-pointer"
+        onClick={() => setIsExpanded(!isExpanded)}
+      >
+        {/* Folder icon with expand/collapse */}
+        <div className="w-8 h-8 rounded-lg bg-[#292524] flex items-center justify-center flex-shrink-0">
+          {group.hasErrors ? (
+            <svg className="w-4 h-4 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+            </svg>
+          ) : isComplete ? (
+            <svg className="w-4 h-4 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+            </svg>
+          ) : isUploading ? (
+            <svg className="w-4 h-4 animate-spin text-amber-500" fill="none" viewBox="0 0 24 24">
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" />
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+            </svg>
+          ) : (
+            <svg className="w-4 h-4 text-amber-500" fill="currentColor" viewBox="0 0 20 20">
+              <path d="M2 6a2 2 0 012-2h5l2 2h5a2 2 0 012 2v6a2 2 0 01-2 2H4a2 2 0 01-2-2V6z" />
+            </svg>
+          )}
+        </div>
+
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2">
+            <p className={`text-sm font-medium truncate ${group.hasErrors ? "text-red-400" : "text-white"}`}>
+              {group.collectionName}
+            </p>
+            <svg
+              className={`w-3 h-3 text-[#57534e] transition-transform ${isExpanded ? "rotate-90" : ""}`}
+              fill="currentColor"
+              viewBox="0 0 20 20"
+            >
+              <path fillRule="evenodd" d="M7.293 14.707a1 1 0 010-1.414L10.586 10 7.293 6.707a1 1 0 011.414-1.414l4 4a1 1 0 010 1.414l-4 4a1 1 0 01-1.414 0z" clipRule="evenodd" />
+            </svg>
+          </div>
+          <p className="text-xs text-[#57534e]">
+            {group.hasErrors
+              ? `${group.errorCount} failed · ${formatBytes(group.totalBytes)}`
+              : isComplete
+              ? `${group.files.length} files · ${formatBytes(group.totalBytes)}`
+              : `${formatBytes(group.bytesUploaded)} / ${formatBytes(group.totalBytes)}`}
+          </p>
+        </div>
+
+        {/* Progress percentage */}
+        {!isComplete && !group.hasErrors && (
+          <span className="text-xs text-amber-500 tabular-nums flex-shrink-0 font-medium">
+            {Math.round(group.percentage)}%
+          </span>
+        )}
+      </div>
+
+      {/* Progress bar */}
+      {!isComplete && !group.hasErrors && (
+        <div className="h-1.5 bg-[#292524] rounded-full overflow-hidden ml-11">
+          <div
+            className="h-full progress-shimmer rounded-full transition-all duration-300 ease-out"
+            style={{ width: `${group.percentage}%` }}
+          />
+        </div>
+      )}
+
+      {/* Expanded file list */}
+      {isExpanded && (
+        <div className="ml-5 border-l-2 border-[#292524] pl-3 mt-1 space-y-0.5 max-h-48 overflow-y-auto">
+          {group.files.map((file) => (
+            <div
+              key={file.id}
+              className="flex items-center gap-2 py-1 px-2 rounded"
+            >
+              {/* Status indicator */}
+              <div className="w-5 h-5 flex items-center justify-center flex-shrink-0">
+                {file.status === "complete" || file.status === "confirming" ? (
+                  <svg className="w-3 h-3 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                  </svg>
+                ) : file.status === "error" ? (
+                  <svg className="w-3 h-3 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                ) : file.status === "uploading" ? (
+                  <svg className="w-3 h-3 animate-spin text-amber-500" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" />
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                  </svg>
+                ) : (
+                  <svg className="w-3 h-3 text-[#57534e]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  </svg>
+                )}
+              </div>
+
+              <span className={`text-xs truncate flex-1 ${file.status === "error" ? "text-red-400" : file.status === "queued" ? "text-[#57534e]" : "text-[#a8a29e]"}`}>
+                {file.filename}
+              </span>
+
+              {file.status === "uploading" && (
+                <span className="text-[10px] text-amber-500 tabular-nums flex-shrink-0">
+                  {Math.round(file.percentage)}%
+                </span>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // Context Menu Component
 function ContextMenu({
   isOpen,
@@ -270,11 +448,28 @@ function ContextMenu({
   hasPassword?: boolean;
   hasBurn?: boolean;
 }) {
-  const menuRef = useRef<HTMLDivElement>(null);
+  const { refs, floatingStyles } = useFloating({
+    open: isOpen,
+    placement: "bottom-end",
+    middleware: [
+      offset(4),
+      flip({ fallbackPlacements: ["top-end", "bottom-start", "top-start"] }),
+      shift({ padding: 8 })
+    ],
+    whileElementsMounted: autoUpdate,
+  });
+
+  // Sync anchor ref to floating reference
+  useEffect(() => {
+    if (anchorRef.current) {
+      refs.setReference(anchorRef.current);
+    }
+  }, [anchorRef, refs, isOpen]);
 
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node) &&
+      const floating = refs.floating.current;
+      if (floating && !floating.contains(e.target as Node) &&
           anchorRef.current && !anchorRef.current.contains(e.target as Node)) {
         onClose();
       }
@@ -284,15 +479,17 @@ function ContextMenu({
       document.addEventListener("mousedown", handleClickOutside);
     }
     return () => document.removeEventListener("mousedown", handleClickOutside);
-  }, [isOpen, onClose, anchorRef]);
+  }, [isOpen, onClose, anchorRef, refs]);
 
   if (!isOpen) return null;
 
   return (
-    <div
-      ref={menuRef}
-      className="absolute right-0 top-full mt-1 z-50 bg-[#1c1917] border border-[#292524] rounded-lg shadow-xl py-1 min-w-[160px]"
-    >
+    <FloatingPortal>
+      <div
+        ref={refs.setFloating}
+        style={floatingStyles}
+        className="z-50 bg-[#1c1917] border border-[#292524] rounded-lg shadow-xl py-1 min-w-[160px]"
+      >
       <button
         onClick={() => { onCopy(); onClose(); }}
         className="w-full px-3 py-2 text-left text-xs text-[#a8a29e] hover:bg-[#292524] hover:text-white flex items-center gap-2 transition-colors cursor-pointer"
@@ -360,7 +557,8 @@ function ContextMenu({
           </button>
         </>
       )}
-    </div>
+      </div>
+    </FloatingPortal>
   );
 }
 
@@ -486,11 +684,18 @@ export function History({ items, uploads, onDelete, onClearUploads, onSetPasswor
   };
 
   const activeUploads = uploads.filter(u => u.status !== "complete");
-  const uploadingCount = uploads.filter(u => u.status === "uploading").length;
-  const completedUploadCount = uploads.filter(u => u.status === "complete" || u.status === "confirming").length;
   const errorCount = uploads.filter(u => u.status === "error").length;
   const hasErrors = errorCount > 0;
   const hasContent = items.length > 0 || activeUploads.length > 0;
+
+  // Group ALL uploads by collection (including completed ones for accurate counts)
+  const { collectionGroups, standaloneUploads } = groupUploadsByCollection(uploads);
+
+  // Filter to only show groups/uploads that have active (non-complete) items
+  const activeCollectionGroups = collectionGroups.filter(g =>
+    g.files.some(f => f.status !== "complete")
+  );
+  const activeStandaloneUploads = standaloneUploads.filter(u => u.status !== "complete");
 
   // Filter items by search query
   const filteredItems = searchQuery.trim()
@@ -563,7 +768,7 @@ export function History({ items, uploads, onDelete, onClearUploads, onSetPasswor
               {hasErrors
                 ? `Upload failed`
                 : activeUploads.length > 0
-                ? `Uploading ${completedUploadCount + uploadingCount} of ${uploads.length}`
+                ? "Uploading"
                 : "Recent Uploads"}
             </h3>
             <div className="flex items-center gap-2">
@@ -596,8 +801,13 @@ export function History({ items, uploads, onDelete, onClearUploads, onSetPasswor
 
       <div className="flex-1 overflow-y-auto px-3 pb-3">
         <div className="space-y-1">
-          {/* Active uploads first */}
-          {activeUploads.map((upload) => (
+          {/* Collection uploads (grouped) */}
+          {activeCollectionGroups.map((group) => (
+            <CollectionUploadItem key={group.collectionId} group={group} />
+          ))}
+
+          {/* Standalone uploads (not part of a collection) */}
+          {activeStandaloneUploads.map((upload) => (
             <div
               key={upload.id}
               className="flex flex-col gap-1.5 py-2 px-2 rounded-lg bg-[#1c1917]/50"

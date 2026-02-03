@@ -14,7 +14,11 @@ use tauri::ipc::Channel;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, State, ActivationPolicy};
-use upload::{create_collection, delete_file, mark_collection_ready, upload_file, UploadProgress, UploadResult};
+use upload::{
+    create_collection, delete_file, mark_collection_ready, upload_file, UploadProgress, UploadResult,
+    init_batch, confirm_batch, upload_to_r2, get_batch_size,
+    BatchFileRequest, BatchConfirmFile,
+};
 use chrono::Utc;
 use uuid::Uuid;
 
@@ -32,112 +36,263 @@ async fn upload_single_file(
 
 const CONCURRENT_UPLOADS: usize = 6;
 
+/// File info for batch processing
+struct FileInfo {
+    path: String,
+    filename: String,
+    size: u64,
+    content_type: String,
+    file_id: String,
+}
+
 #[tauri::command]
 async fn upload_files(
     paths: Vec<String>,
     on_progress: Channel<UploadProgress>,
 ) -> Result<Vec<UploadResult>, String> {
-    // Single file - upload directly
+    // Single file - upload directly (no batch needed)
     if paths.len() == 1 {
         let result = upload_file(paths[0].clone(), None, on_progress, None).await?;
         return Ok(vec![result]);
     }
 
-    // Multiple files - generate file_ids and send queued status for all files first
-    let mut file_infos: Vec<(String, String)> = Vec::new(); // (path, file_id)
+    // Multiple files - use batch upload
+    upload_files_batch(paths, on_progress).await
+}
+
+/// Upload multiple files using batch API endpoints (much more efficient)
+/// This uses init-batch and confirm-batch to minimize API calls
+async fn upload_files_batch(
+    paths: Vec<String>,
+    on_progress: Channel<UploadProgress>,
+) -> Result<Vec<UploadResult>, String> {
+    let batch_size = get_batch_size();
+
+    // Generate a temporary collection ID for UI grouping before API call
+    let temp_collection_id = Uuid::new_v4().to_string();
+    let collection_name = format!("{} files", paths.len());
+
+    // Step 1: Collect all file metadata and send queued status
+    let mut file_infos: Vec<FileInfo> = Vec::new();
 
     for path in &paths {
         let p = Path::new(path);
         let filename = p.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
         let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let content_type = mime_guess::from_path(p).first_or_octet_stream().to_string();
         let file_id = Uuid::new_v4().to_string();
 
         let _ = on_progress.send(UploadProgress {
             file_id: file_id.clone(),
-            filename,
+            filename: filename.clone(),
             bytes_uploaded: 0,
             total_bytes: size,
             percentage: 0.0,
             status: "queued".to_string(),
+            collection_id: Some(temp_collection_id.clone()),
+            collection_name: Some(collection_name.clone()),
         });
 
-        file_infos.push((path.clone(), file_id));
+        file_infos.push(FileInfo {
+            path: path.clone(),
+            filename,
+            size,
+            content_type,
+            file_id,
+        });
     }
 
-    // Create a collection
+    // Step 2: Create collection
     let collection = create_collection(Some(paths.len())).await?;
-    let collection_id = Arc::new(collection.id.clone());
-    let on_progress = Arc::new(on_progress);
+    let collection_id = collection.id.clone();
 
-    // Use a channel-based work queue (pull-based like web app)
-    let (tx, rx) = tokio::sync::mpsc::channel::<(String, String)>(file_infos.len());
-    let rx = Arc::new(tokio::sync::Mutex::new(rx));
+    // Use the same temp_collection_id for ALL progress events (UI grouping only)
+    // The real collection_id is only used for API calls
+    let collection_id_for_progress = temp_collection_id.clone();
 
-    // Send all work items to the queue
-    for item in file_infos {
-        let _ = tx.send(item).await;
-    }
-    drop(tx); // Close sender so workers know when done
+    eprintln!("[Batch] Created collection {} for {} files", collection_id, file_infos.len());
 
-    // Spawn worker tasks
-    let mut handles = Vec::new();
-    for _ in 0..CONCURRENT_UPLOADS {
-        let rx = rx.clone();
-        let coll_id = collection_id.clone();
-        let progress = on_progress.clone();
+    // Step 3: Process files in batches of 250
+    let mut all_results: Vec<UploadResult> = Vec::new();
+    let mut collection_files: Vec<CollectionFileItem> = Vec::new();
+    let mut total_size: u64 = 0;
 
-        handles.push(tokio::spawn(async move {
-            let mut results: Vec<UploadResult> = Vec::new();
-            loop {
-                let item = {
-                    let mut rx = rx.lock().await;
-                    rx.recv().await
-                };
-                match item {
-                    Some((path, file_id)) => {
-                        match upload_file(path, Some((*coll_id).clone()), (*progress).clone(), Some(file_id)).await {
-                            Ok(r) => results.push(r),
-                            Err(e) => eprintln!("Failed to upload file: {}", e),
+    for (batch_index, batch) in file_infos.chunks(batch_size).enumerate() {
+        eprintln!("[Batch] Processing batch {} ({} files)", batch_index + 1, batch.len());
+
+        // Step 3a: Init batch - get presigned URLs for all files in this batch
+        let init_requests: Vec<BatchFileRequest> = batch.iter().map(|f| BatchFileRequest {
+            filename: f.filename.clone(),
+            content_type: f.content_type.clone(),
+            size: f.size,
+        }).collect();
+
+        let init_results = init_batch(init_requests).await?;
+
+        // Step 3b: Upload files to R2 in parallel (using presigned URLs)
+        let on_progress = Arc::new(on_progress.clone());
+        let (tx, rx) = tokio::sync::mpsc::channel::<(usize, FileInfo, String, String)>(batch.len());
+        let rx = Arc::new(tokio::sync::Mutex::new(rx));
+
+        // Build work items with init results
+        for (idx, file_info) in batch.iter().enumerate() {
+            let idx_str = idx.to_string();
+            if let Some(init_result) = init_results.get(&idx_str) {
+                if let (Some(upload_url), Some(r2_key)) = (&init_result.upload_url, &init_result.r2_key) {
+                    let _ = tx.send((idx, FileInfo {
+                        path: file_info.path.clone(),
+                        filename: file_info.filename.clone(),
+                        size: file_info.size,
+                        content_type: file_info.content_type.clone(),
+                        file_id: file_info.file_id.clone(),
+                    }, upload_url.clone(), r2_key.clone())).await;
+                } else {
+                    eprintln!("[Batch] Missing URL/key for file {}: {:?}", idx, init_result.error);
+                }
+            }
+        }
+        drop(tx);
+
+        // Spawn workers to upload to R2
+        let mut handles = Vec::new();
+        for _ in 0..CONCURRENT_UPLOADS {
+            let rx = rx.clone();
+            let progress = on_progress.clone();
+            let coll_id = collection_id_for_progress.clone();
+            let coll_name = collection_name.clone();
+
+            handles.push(tokio::spawn(async move {
+                let mut uploaded: Vec<(usize, String, String, String, u64)> = Vec::new(); // (idx, filename, content_type, r2_key, size)
+                loop {
+                    let item = {
+                        let mut rx = rx.lock().await;
+                        rx.recv().await
+                    };
+                    match item {
+                        Some((idx, file_info, upload_url, r2_key)) => {
+                            let path = Path::new(&file_info.path);
+
+                            // Update status to uploading
+                            let _ = progress.send(UploadProgress {
+                                file_id: file_info.file_id.clone(),
+                                filename: file_info.filename.clone(),
+                                bytes_uploaded: 0,
+                                total_bytes: file_info.size,
+                                percentage: 0.0,
+                                status: "uploading".to_string(),
+                                collection_id: Some(coll_id.clone()),
+                                collection_name: Some(coll_name.clone()),
+                            });
+
+                            // Upload to R2
+                            match upload_to_r2(
+                                path,
+                                &upload_url,
+                                &file_info.file_id,
+                                &file_info.filename,
+                                file_info.size,
+                                &progress,
+                                Some(coll_id.clone()),
+                                Some(coll_name.clone()),
+                            ).await {
+                                Ok(()) => {
+                                    // Mark this file as uploaded (confirming stage)
+                                    let _ = progress.send(UploadProgress {
+                                        file_id: file_info.file_id.clone(),
+                                        filename: file_info.filename.clone(),
+                                        bytes_uploaded: file_info.size,
+                                        total_bytes: file_info.size,
+                                        percentage: 100.0,
+                                        status: "confirming".to_string(),
+                                        collection_id: Some(coll_id.clone()),
+                                        collection_name: Some(coll_name.clone()),
+                                    });
+                                    uploaded.push((idx, file_info.filename, file_info.content_type, r2_key, file_info.size));
+                                }
+                                Err(e) => {
+                                    eprintln!("[Batch] Failed to upload {}: {}", file_info.filename, e);
+                                    let _ = progress.send(UploadProgress {
+                                        file_id: file_info.file_id.clone(),
+                                        filename: file_info.filename.clone(),
+                                        bytes_uploaded: 0,
+                                        total_bytes: file_info.size,
+                                        percentage: 0.0,
+                                        status: "error".to_string(),
+                                        collection_id: Some(coll_id.clone()),
+                                        collection_name: Some(coll_name.clone()),
+                                    });
+                                }
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                uploaded
+            }));
+        }
+
+        // Collect uploaded files
+        let mut uploaded_files: Vec<BatchConfirmFile> = Vec::new();
+        let mut batch_uploaded: Vec<(String, u64)> = Vec::new(); // (filename, size)
+
+        for handle in handles {
+            match handle.await {
+                Ok(results) => {
+                    for (_, filename, content_type, r2_key, size) in results {
+                        uploaded_files.push(BatchConfirmFile {
+                            filename: filename.clone(),
+                            size,
+                            content_type,
+                            r2_key,
+                        });
+                        batch_uploaded.push((filename, size));
+                    }
+                }
+                Err(e) => eprintln!("[Batch] Worker error: {}", e),
+            }
+        }
+
+        // Step 3c: Confirm batch
+        if !uploaded_files.is_empty() {
+            let confirm_results = confirm_batch(Some(collection_id.clone()), uploaded_files).await?;
+
+            // Process confirm results
+            for (idx_str, result) in confirm_results {
+                if result.success {
+                    if let Some(file) = result.file {
+                        if let Ok(idx) = idx_str.parse::<usize>() {
+                            if idx < batch_uploaded.len() {
+                                let (filename, size) = &batch_uploaded[idx];
+                                total_size += size;
+
+                                collection_files.push(CollectionFileItem {
+                                    id: file.id.clone(),
+                                    filename: filename.clone(),
+                                    url: file.url.clone(),
+                                    size: *size,
+                                });
+
+                                all_results.push(UploadResult {
+                                    url: file.url,
+                                    filename: filename.clone(),
+                                    size: *size,
+                                    is_collection: false,
+                                    file_count: None,
+                                });
+                            }
                         }
                     }
-                    None => break, // Channel closed, no more work
                 }
             }
-            results
-        }));
-    }
-
-    // Collect results from all workers
-    let mut results = Vec::new();
-    let mut total_size: u64 = 0;
-    let mut collection_files: Vec<CollectionFileItem> = Vec::new();
-
-    for handle in handles {
-        match handle.await {
-            Ok(worker_results) => {
-                for r in worker_results {
-                    total_size += r.size;
-                    // Store file info for the collection
-                    collection_files.push(CollectionFileItem {
-                        id: Uuid::new_v4().to_string(),
-                        filename: r.filename.clone(),
-                        url: r.url.clone(),
-                        size: r.size,
-                    });
-                    results.push(r);
-                }
-            }
-            Err(e) => eprintln!("Worker task failed: {}", e),
         }
     }
 
-    // Mark collection as ready
-    let final_collection = mark_collection_ready((*collection_id).clone()).await?;
+    // Step 4: Mark collection ready
+    let final_collection = mark_collection_ready(collection_id.clone()).await?;
 
-    // Add collection to history with individual files
-    let file_count = results.len() as u32;
+    // Step 5: Add to history
+    let file_count = all_results.len() as u32;
 
-    // Parse expires_at from API response
     let expires_at = final_collection.expires_at.as_ref().and_then(|s| {
         chrono::DateTime::parse_from_rfc3339(s)
             .ok()
@@ -159,10 +314,24 @@ async fn upload_files(
     };
     let _ = add_to_history(history_item);
 
-    // Return the collection as the first result
+    // Send complete status for all files
+    for file_info in &file_infos {
+        let _ = on_progress.send(UploadProgress {
+            file_id: file_info.file_id.clone(),
+            filename: file_info.filename.clone(),
+            bytes_uploaded: file_info.size,
+            total_bytes: file_info.size,
+            percentage: 100.0,
+            status: "complete".to_string(),
+            collection_id: Some(collection_id.clone()),
+            collection_name: Some(collection_name.clone()),
+        });
+    }
+
+    // Return collection result
     let collection_result = UploadResult {
         url: final_collection.url,
-        filename: format!("{} files", file_count),
+        filename: collection_name,
         size: total_size,
         is_collection: true,
         file_count: Some(file_count),
@@ -205,96 +374,217 @@ async fn upload_folder(
         return Err("No files found in folder".to_string());
     }
 
-    // Generate file_ids and send queued status for all files first
-    let mut file_infos: Vec<(String, String)> = Vec::new(); // (path, file_id)
+    // Use batch upload (reusing the same logic as upload_files)
+    let batch_size = get_batch_size();
+
+    // Generate a temporary collection ID for UI grouping before API call
+    let temp_collection_id = Uuid::new_v4().to_string();
+
+    // Step 1: Collect all file metadata and send queued status
+    let mut file_infos: Vec<FileInfo> = Vec::new();
 
     for file_path in &files {
         let p = Path::new(file_path);
         let filename = p.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
         let size = fs::metadata(file_path).map(|m| m.len()).unwrap_or(0);
+        let content_type = mime_guess::from_path(p).first_or_octet_stream().to_string();
         let file_id = Uuid::new_v4().to_string();
 
         let _ = on_progress.send(UploadProgress {
             file_id: file_id.clone(),
-            filename,
+            filename: filename.clone(),
             bytes_uploaded: 0,
             total_bytes: size,
             percentage: 0.0,
             status: "queued".to_string(),
+            collection_id: Some(temp_collection_id.clone()),
+            collection_name: Some(folder_name.clone()),
         });
 
-        file_infos.push((file_path.clone(), file_id));
+        file_infos.push(FileInfo {
+            path: file_path.clone(),
+            filename,
+            size,
+            content_type,
+            file_id,
+        });
     }
 
+    // Step 2: Create collection
     let collection = create_collection(Some(files.len())).await?;
-    let collection_id = Arc::new(collection.id.clone());
-    let on_progress = Arc::new(on_progress);
+    let collection_id = collection.id.clone();
 
-    // Use a channel-based work queue (pull-based like web app)
-    let (tx, rx) = tokio::sync::mpsc::channel::<(String, String)>(file_infos.len());
-    let rx = Arc::new(tokio::sync::Mutex::new(rx));
+    // Use the same temp_collection_id for ALL progress events (UI grouping only)
+    let collection_id_for_progress = temp_collection_id.clone();
 
-    // Send all work items to the queue
-    for item in file_infos {
-        let _ = tx.send(item).await;
-    }
-    drop(tx); // Close sender so workers know when done
+    eprintln!("[Batch] Created collection {} for folder '{}' ({} files)", collection_id, folder_name, file_infos.len());
 
-    // Spawn worker tasks
-    let mut handles = Vec::new();
-    for _ in 0..CONCURRENT_UPLOADS {
-        let rx = rx.clone();
-        let coll_id = collection_id.clone();
-        let progress = on_progress.clone();
-
-        handles.push(tokio::spawn(async move {
-            let mut results: Vec<UploadResult> = Vec::new();
-            loop {
-                let item = {
-                    let mut rx = rx.lock().await;
-                    rx.recv().await
-                };
-                match item {
-                    Some((path, file_id)) => {
-                        match upload_file(path, Some((*coll_id).clone()), (*progress).clone(), Some(file_id)).await {
-                            Ok(r) => results.push(r),
-                            Err(e) => eprintln!("Failed to upload file: {}", e),
-                        }
-                    }
-                    None => break, // Channel closed, no more work
-                }
-            }
-            results
-        }));
-    }
-
-    // Collect results from all workers
+    // Step 3: Process files in batches
+    let mut collection_files: Vec<CollectionFileItem> = Vec::new();
     let mut total_size: u64 = 0;
     let mut success_count: u32 = 0;
-    let mut collection_files: Vec<CollectionFileItem> = Vec::new();
 
-    for handle in handles {
-        match handle.await {
-            Ok(worker_results) => {
-                for r in worker_results {
-                    total_size += r.size;
-                    success_count += 1;
-                    // Store file info for the collection
-                    collection_files.push(CollectionFileItem {
-                        id: Uuid::new_v4().to_string(),
-                        filename: r.filename.clone(),
-                        url: r.url.clone(),
-                        size: r.size,
-                    });
+    for (batch_index, batch) in file_infos.chunks(batch_size).enumerate() {
+        eprintln!("[Batch] Processing batch {} ({} files)", batch_index + 1, batch.len());
+
+        // Init batch
+        let init_requests: Vec<BatchFileRequest> = batch.iter().map(|f| BatchFileRequest {
+            filename: f.filename.clone(),
+            content_type: f.content_type.clone(),
+            size: f.size,
+        }).collect();
+
+        let init_results = init_batch(init_requests).await?;
+
+        // Upload to R2 in parallel
+        let on_progress = Arc::new(on_progress.clone());
+        let (tx, rx) = tokio::sync::mpsc::channel::<(usize, FileInfo, String, String)>(batch.len());
+        let rx = Arc::new(tokio::sync::Mutex::new(rx));
+
+        for (idx, file_info) in batch.iter().enumerate() {
+            let idx_str = idx.to_string();
+            if let Some(init_result) = init_results.get(&idx_str) {
+                if let (Some(upload_url), Some(r2_key)) = (&init_result.upload_url, &init_result.r2_key) {
+                    let _ = tx.send((idx, FileInfo {
+                        path: file_info.path.clone(),
+                        filename: file_info.filename.clone(),
+                        size: file_info.size,
+                        content_type: file_info.content_type.clone(),
+                        file_id: file_info.file_id.clone(),
+                    }, upload_url.clone(), r2_key.clone())).await;
                 }
             }
-            Err(e) => eprintln!("Worker task failed: {}", e),
+        }
+        drop(tx);
+
+        // Spawn workers
+        let mut handles = Vec::new();
+        for _ in 0..CONCURRENT_UPLOADS {
+            let rx = rx.clone();
+            let progress = on_progress.clone();
+            let coll_id = collection_id_for_progress.clone();
+            let coll_name = folder_name.clone();
+
+            handles.push(tokio::spawn(async move {
+                let mut uploaded: Vec<(usize, String, String, String, u64)> = Vec::new();
+                loop {
+                    let item = {
+                        let mut rx = rx.lock().await;
+                        rx.recv().await
+                    };
+                    match item {
+                        Some((idx, file_info, upload_url, r2_key)) => {
+                            let path = Path::new(&file_info.path);
+
+                            let _ = progress.send(UploadProgress {
+                                file_id: file_info.file_id.clone(),
+                                filename: file_info.filename.clone(),
+                                bytes_uploaded: 0,
+                                total_bytes: file_info.size,
+                                percentage: 0.0,
+                                status: "uploading".to_string(),
+                                collection_id: Some(coll_id.clone()),
+                                collection_name: Some(coll_name.clone()),
+                            });
+
+                            match upload_to_r2(
+                                path,
+                                &upload_url,
+                                &file_info.file_id,
+                                &file_info.filename,
+                                file_info.size,
+                                &progress,
+                                Some(coll_id.clone()),
+                                Some(coll_name.clone()),
+                            ).await {
+                                Ok(()) => {
+                                    // Mark this file as uploaded (confirming stage)
+                                    let _ = progress.send(UploadProgress {
+                                        file_id: file_info.file_id.clone(),
+                                        filename: file_info.filename.clone(),
+                                        bytes_uploaded: file_info.size,
+                                        total_bytes: file_info.size,
+                                        percentage: 100.0,
+                                        status: "confirming".to_string(),
+                                        collection_id: Some(coll_id.clone()),
+                                        collection_name: Some(coll_name.clone()),
+                                    });
+                                    uploaded.push((idx, file_info.filename, file_info.content_type, r2_key, file_info.size));
+                                }
+                                Err(e) => {
+                                    eprintln!("[Batch] Failed to upload {}: {}", file_info.filename, e);
+                                    let _ = progress.send(UploadProgress {
+                                        file_id: file_info.file_id.clone(),
+                                        filename: file_info.filename.clone(),
+                                        bytes_uploaded: 0,
+                                        total_bytes: file_info.size,
+                                        percentage: 0.0,
+                                        status: "error".to_string(),
+                                        collection_id: Some(coll_id.clone()),
+                                        collection_name: Some(coll_name.clone()),
+                                    });
+                                }
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                uploaded
+            }));
+        }
+
+        // Collect uploaded files
+        let mut uploaded_files: Vec<BatchConfirmFile> = Vec::new();
+        let mut batch_uploaded: Vec<(String, u64)> = Vec::new();
+
+        for handle in handles {
+            match handle.await {
+                Ok(results) => {
+                    for (_, filename, content_type, r2_key, size) in results {
+                        uploaded_files.push(BatchConfirmFile {
+                            filename: filename.clone(),
+                            size,
+                            content_type,
+                            r2_key,
+                        });
+                        batch_uploaded.push((filename, size));
+                    }
+                }
+                Err(e) => eprintln!("[Batch] Worker error: {}", e),
+            }
+        }
+
+        // Confirm batch
+        if !uploaded_files.is_empty() {
+            let confirm_results = confirm_batch(Some(collection_id.clone()), uploaded_files).await?;
+
+            for (idx_str, result) in confirm_results {
+                if result.success {
+                    if let Some(file) = result.file {
+                        if let Ok(idx) = idx_str.parse::<usize>() {
+                            if idx < batch_uploaded.len() {
+                                let (filename, size) = &batch_uploaded[idx];
+                                total_size += size;
+                                success_count += 1;
+
+                                collection_files.push(CollectionFileItem {
+                                    id: file.id.clone(),
+                                    filename: filename.clone(),
+                                    url: file.url.clone(),
+                                    size: *size,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
-    let final_collection = mark_collection_ready((*collection_id).clone()).await?;
+    // Mark collection ready
+    let final_collection = mark_collection_ready(collection_id.clone()).await?;
 
-    // Parse expires_at from API response
+    // Add to history
     let expires_at = final_collection.expires_at.as_ref().and_then(|s| {
         chrono::DateTime::parse_from_rfc3339(s)
             .ok()
@@ -315,6 +605,20 @@ async fn upload_folder(
         expires_at,
     };
     let _ = add_to_history(history_item);
+
+    // Send complete status
+    for file_info in &file_infos {
+        let _ = on_progress.send(UploadProgress {
+            file_id: file_info.file_id.clone(),
+            filename: file_info.filename.clone(),
+            bytes_uploaded: file_info.size,
+            total_bytes: file_info.size,
+            percentage: 100.0,
+            status: "complete".to_string(),
+            collection_id: Some(collection_id.clone()),
+            collection_name: Some(folder_name.clone()),
+        });
+    }
 
     Ok(UploadResult {
         url: final_collection.url,
