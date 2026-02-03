@@ -27,7 +27,6 @@
     "global-shortcut:allow-unregister",
     "fs:default",
     "fs:allow-read",
-    "screenshots:default",
-    "macos-permissions:default"
+    "screenshots:default"
   ]
 }
