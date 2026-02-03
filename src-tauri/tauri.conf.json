@@ -36,7 +36,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "UPDATER_PUBKEY_PLACEHOLDER",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDZGQTJFNTNDNTdBMUMwMTkKUldRWndLRlhQT1dpYnhlMUcvdHFLSHhDMWQrK1ZWa01wWHZIcXBQWEFBZXAzTURlQURiNkpvY1IK",
       "endpoints": [
         "https://github.com/storageto/desktop/releases/latest/download/latest.json"
       ]
