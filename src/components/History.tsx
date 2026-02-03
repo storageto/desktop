@@ -38,7 +38,6 @@ export interface UploadItem {
 interface HistoryProps {
   items: HistoryItem[];
   uploads: UploadItem[];
-  onClear: () => void;
   onDelete: (fileId: string, url: string, isCollection: boolean) => Promise<void>;
   onClearUploads?: () => void;
   onSetPassword: (fileId: string, isCollection: boolean, password: string) => void;
@@ -365,7 +364,7 @@ function ContextMenu({
   );
 }
 
-export function History({ items, uploads, onClear, onDelete, onClearUploads, onSetPassword, onRemovePassword, onSetExpiry, onSetBurnAfterReading, onRemoveBurnAfterReading }: HistoryProps) {
+export function History({ items, uploads, onDelete, onClearUploads, onSetPassword, onRemovePassword, onSetExpiry, onSetBurnAfterReading, onRemoveBurnAfterReading }: HistoryProps) {
   const [deleteConfirm, setDeleteConfirm] = useState<{ fileId: string; url: string; filename: string; isCollection: boolean } | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
   const [expandedCollections, setExpandedCollections] = useState<Set<string>>(new Set());
@@ -812,7 +811,7 @@ export function History({ items, uploads, onClear, onDelete, onClearUploads, onS
                             onOpen={() => handleOpen(file.url)}
                             onPassword={() => openPasswordModal(file, false)}
                             onExpiry={() => openExpiryModal(file, false)}
-                            onBurn={() => handleBurnAfterReading(file, false)}
+                            onBurn={() => onSetBurnAfterReading(getFileIdFromUrl(file.url), false)}
                             anchorRef={{ current: menuButtonRefs.current.get(fileMenuKey) || null }}
                             isChildFile={true}
                           />

@@ -333,15 +333,6 @@ function App() {
     }
   };
 
-  const handleClearHistory = async () => {
-    try {
-      await invoke("clear_upload_history");
-      setHistory([]);
-    } catch (err) {
-      console.error("Failed to clear history:", err);
-    }
-  };
-
   const handleDeleteFile = async (fileId: string, url: string, isCollection: boolean) => {
     try {
       await invoke("delete_uploaded_file", { fileId, url, isCollection });
@@ -559,7 +550,6 @@ function App() {
         <History
           items={history}
           uploads={uploads}
-          onClear={handleClearHistory}
           onDelete={handleDeleteFile}
           onClearUploads={() => { setUploads([]); setIsUploading(false); }}
           onSetPassword={handleSetPassword}
