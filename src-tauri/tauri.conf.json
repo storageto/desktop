@@ -56,7 +56,12 @@
     "shortDescription": "Upload files from your menu bar",
     "longDescription": "StorageTo Desktop lets you quickly upload files to storage.to directly from your menu bar. Drag and drop files, capture screenshots, and get shareable links instantly.",
     "macOS": {
-      "minimumSystemVersion": "10.15"
+      "minimumSystemVersion": "10.15",
+      "dmg": {
+        "appPosition": { "x": 130, "y": 150 },
+        "applicationFolderPosition": { "x": 380, "y": 150 },
+        "windowSize": { "width": 540, "height": 380 }
+      }
     },
     "windows": {
       "webviewInstallMode": {

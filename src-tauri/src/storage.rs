@@ -40,6 +40,8 @@ pub struct AppConfig {
     pub upload_history: Vec<UploadHistoryItem>,
     pub auto_copy_url: bool,
     pub show_notifications: bool,
+    #[serde(default)]
+    pub has_launched: bool,
 }
 
 impl AppConfig {
@@ -50,6 +52,7 @@ impl AppConfig {
             upload_history: Vec::new(),
             auto_copy_url: true,
             show_notifications: true,
+            has_launched: false,
         }
     }
 }
@@ -157,6 +160,18 @@ pub fn set_api_url(url: String) -> Result<(), String> {
     let mut config = load_config();
     config.api_url = url;
     save_config(&config)
+}
+
+pub fn check_first_launch() -> bool {
+    let config = load_config();
+    if !config.has_launched {
+        // Mark as launched for next time
+        let mut new_config = config;
+        new_config.has_launched = true;
+        let _ = save_config(&new_config);
+        return true;
+    }
+    false
 }
 
 pub fn update_history_item_protection(

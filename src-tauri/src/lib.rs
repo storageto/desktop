@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use storage::{
     clear_history, get_history, load_config, save_config, AppConfig, UploadHistoryItem,
-    add_to_history, remove_from_history, CollectionFileItem,
+    add_to_history, remove_from_history, CollectionFileItem, check_first_launch,
 };
 use tauri::ipc::Channel;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
@@ -519,7 +519,7 @@ pub fn run() {
 
             // Build tray icon
             // Load tray icon (monochrome for light/dark mode support)
-            let _tray = TrayIconBuilder::new()
+            let tray = TrayIconBuilder::new()
                 .icon(tauri::include_image!("icons/tray.png"))
                 .icon_as_template(true)  // macOS will auto-invert for dark mode
                 .menu(&menu)
@@ -580,6 +580,19 @@ pub fn run() {
                     let _ = app_handle.emit("screenshot-requested", ());
                 }
             });
+
+            // Show notification on first launch
+            if check_first_launch() {
+                use tauri_plugin_notification::NotificationExt;
+                let _ = app.notification()
+                    .builder()
+                    .title("StorageTo is running!")
+                    .body("Click the menu bar icon to upload files.")
+                    .show();
+            }
+
+            // Keep tray reference alive
+            let _ = tray;
 
             Ok(())
         })
