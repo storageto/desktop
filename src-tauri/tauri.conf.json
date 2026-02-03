@@ -34,6 +34,14 @@
       "csp": "default-src 'self'; connect-src 'self' https://storage.to https://*.storage.to https://*.r2.cloudflarestorage.com https://*.cloudflare.com; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'"
     }
   },
+  "plugins": {
+    "updater": {
+      "pubkey": "UPDATER_PUBKEY_PLACEHOLDER",
+      "endpoints": [
+        "https://github.com/storageto/desktop/releases/latest/download/latest.json"
+      ]
+    }
+  },
   "bundle": {
     "active": true,
     "targets": "all",
