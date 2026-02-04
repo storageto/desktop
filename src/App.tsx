@@ -8,6 +8,7 @@ import { History, HistoryItem, UploadItem } from "./components/History";
 import { ToastContainer, useToast } from "./components/Toast";
 import { Tooltip } from "./components/Tooltip";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getVersion } from "@tauri-apps/api/app";
 import { reportError } from "./errorReporter";
 import { trackUploadComplete, trackScreenshotComplete } from "./analyticsReporter";
 
@@ -73,6 +74,7 @@ function App() {
   const [uploads, setUploads] = useState<UploadItem[]>([]);
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [isUploading, setIsUploading] = useState(false);
+  const [appVersion, setAppVersion] = useState<string | null>(null);
   const { toasts, addToast, dismissToast } = useToast();
 
   // Track last progress update time to detect stuck uploads
@@ -90,9 +92,10 @@ function App() {
     }
   }, []);
 
-  // Load history on mount
+  // Load history and version on mount
   useEffect(() => {
     loadHistory();
+    getVersion().then(setAppVersion).catch(() => {});
   }, []);
 
   // Global error handler - catch any unhandled errors and reset state
@@ -646,10 +649,15 @@ function App() {
           className="flex items-center justify-between px-3 py-2 bg-[#1c1917] border-b border-[#292524]"
           data-tauri-drag-region
         >
-          <div className="flex items-center" data-tauri-drag-region>
+          <div className="flex items-center gap-1.5" data-tauri-drag-region>
             <span className="font-semibold text-white text-base tracking-tight" data-tauri-drag-region>
               storage<span className="text-pink-400">.to</span>
             </span>
+            {appVersion && (
+              <span className="text-[10px] text-stone-500" data-tauri-drag-region>
+                v{appVersion}
+              </span>
+            )}
           </div>
 
           {isUploading ? (
