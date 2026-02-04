@@ -9,6 +9,7 @@ import { ToastContainer, useToast } from "./components/Toast";
 import { Tooltip } from "./components/Tooltip";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { reportError } from "./errorReporter";
+import { trackUploadComplete, trackScreenshotComplete } from "./analyticsReporter";
 
 // Timeout for stuck uploads (60 seconds with no progress = stuck)
 const UPLOAD_TIMEOUT_MS = 60000;
@@ -304,6 +305,13 @@ function App() {
             `${result.file_count} files uploaded - URL copied!`
           );
 
+          // Track analytics
+          trackUploadComplete({
+            fileCount: result.file_count || 1,
+            totalSize: result.size,
+            isCollection: true,
+          });
+
           // Clear uploads and refresh history
           setUploads([]);
           await loadHistory();
@@ -335,6 +343,14 @@ function App() {
             `${results.length} files uploaded - Last URL copied!`
           );
         }
+
+        // Track analytics
+        const totalSize = results.reduce((sum, r) => sum + r.size, 0);
+        trackUploadComplete({
+          fileCount: results.length,
+          totalSize,
+          isCollection: results.length > 1 || lastResult.is_collection,
+        });
 
         // Clear uploads and refresh history
         setUploads([]);
@@ -404,6 +420,9 @@ function App() {
 
       await copyToClipboard(result.url);
       await showNotification("Screenshot uploaded", "URL copied to clipboard!");
+
+      // Track analytics
+      trackScreenshotComplete();
 
       // Clear uploads and refresh history
       setUploads([]);

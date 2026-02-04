@@ -5,10 +5,14 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import App from "./App";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { initErrorReporter } from "./errorReporter";
+import { initAnalyticsReporter } from "./analyticsReporter";
 import "./index.css";
 
 // Initialize error reporter as early as possible
 initErrorReporter();
+
+// Initialize analytics reporter
+initAnalyticsReporter();
 
 // Check for updates and auto-install
 async function checkForUpdates() {
