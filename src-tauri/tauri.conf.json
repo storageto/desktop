@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "StorageTo",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "identifier": "to.storage.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -36,7 +36,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDZGQTJFNTNDNTdBMUMwMTkKUldRWndLRlhQT1dpYnhlMUcvdHFLSHhDMWQrK1ZWa01wWHZIcXBQWEFBZXAzTURlQURiNkpvY1IK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDRDQjk0MDM0QjFEODNBRDUKUldUVk90aXhORUM1VEpQS3lRZG5LazZraEVUbFo2a3NPOXBaZVV2NHl6U1Rpd1RRcjFsSWRMVysK",
       "endpoints": [
         "https://github.com/storageto/desktop/releases/latest/download/latest.json"
       ]
