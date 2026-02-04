@@ -727,6 +727,55 @@ fn get_config(state: State<AppState>) -> AppConfig {
     state.config.lock().unwrap().clone()
 }
 
+/// Take a screenshot using native OS tools
+/// macOS: Uses `screencapture -i` for interactive region selection
+/// Windows: Falls back to full-screen capture (for now)
+#[tauri::command]
+async fn take_screenshot() -> Result<String, String> {
+    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+    let filename = format!("screenshot_{}.png", timestamp);
+
+    // Get temp directory for the screenshot
+    let temp_dir = std::env::temp_dir();
+    let screenshot_path = temp_dir.join(&filename);
+    let path_str = screenshot_path.to_string_lossy().to_string();
+
+    #[cfg(target_os = "macos")]
+    {
+        // Use native screencapture with interactive selection
+        let output = std::process::Command::new("screencapture")
+            .arg("-i")  // Interactive mode (region selection)
+            .arg("-x")  // No sound
+            .arg(&path_str)
+            .output()
+            .map_err(|e| format!("Failed to run screencapture: {}", e))?;
+
+        if !output.status.success() {
+            // User likely cancelled (pressed Escape)
+            return Err("Screenshot cancelled".to_string());
+        }
+
+        // Check if file was actually created (user might have cancelled)
+        if !screenshot_path.exists() {
+            return Err("Screenshot cancelled".to_string());
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // For Windows, use snippingtool /clip and read from clipboard
+        // For now, fall back to error - we'll implement this later
+        return Err("Region selection not yet supported on Windows. Use the full-screen capture.".to_string());
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        return Err("Screenshots not supported on this platform".to_string());
+    }
+
+    Ok(path_str)
+}
+
 #[tauri::command]
 fn update_config(state: State<AppState>, config: AppConfig) -> Result<(), String> {
     let mut current = state.config.lock().unwrap();
@@ -917,6 +966,7 @@ pub fn run() {
             update_history_protection,
             get_config,
             update_config,
+            take_screenshot,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

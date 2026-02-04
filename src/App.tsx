@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
@@ -8,8 +8,10 @@ import { History, HistoryItem, UploadItem } from "./components/History";
 import { ToastContainer, useToast } from "./components/Toast";
 import { Tooltip } from "./components/Tooltip";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { getScreenshotableMonitors, getMonitorScreenshot } from "tauri-plugin-screenshots-api";
-import { checkScreenRecordingPermission, requestScreenRecordingPermission } from "tauri-plugin-macos-permissions-api";
+import { reportError } from "./errorReporter";
+
+// Timeout for stuck uploads (60 seconds with no progress = stuck)
+const UPLOAD_TIMEOUT_MS = 60000;
 
 interface UploadProgress {
   file_id: string;
@@ -72,10 +74,106 @@ function App() {
   const [isUploading, setIsUploading] = useState(false);
   const { toasts, addToast, dismissToast } = useToast();
 
+  // Track last progress update time to detect stuck uploads
+  const lastProgressTime = useRef<number>(Date.now());
+  const uploadTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Force reset function - nuclear option to unstick the app
+  const forceReset = useCallback(() => {
+    console.log("[Upload] Force reset triggered");
+    setIsUploading(false);
+    setUploads([]);
+    if (uploadTimeoutRef.current) {
+      clearTimeout(uploadTimeoutRef.current);
+      uploadTimeoutRef.current = null;
+    }
+  }, []);
+
   // Load history on mount
   useEffect(() => {
     loadHistory();
   }, []);
+
+  // Global error handler - catch any unhandled errors and reset state
+  useEffect(() => {
+    const handleError = (event: ErrorEvent) => {
+      console.error("[Global] Unhandled error:", event.error);
+      // If we're in an upload state, reset it
+      if (isUploading) {
+        console.log("[Global] Resetting upload state due to unhandled error");
+        forceReset();
+      }
+    };
+
+    const handleUnhandledRejection = (event: PromiseRejectionEvent) => {
+      console.error("[Global] Unhandled promise rejection:", event.reason);
+      // If we're in an upload state, reset it
+      if (isUploading) {
+        console.log("[Global] Resetting upload state due to unhandled rejection");
+        forceReset();
+      }
+    };
+
+    window.addEventListener("error", handleError);
+    window.addEventListener("unhandledrejection", handleUnhandledRejection);
+
+    return () => {
+      window.removeEventListener("error", handleError);
+      window.removeEventListener("unhandledrejection", handleUnhandledRejection);
+    };
+  }, [isUploading, forceReset]);
+
+  // Watchdog: Auto-reset if upload is stuck (no progress for UPLOAD_TIMEOUT_MS)
+  useEffect(() => {
+    if (!isUploading) {
+      // Clear any existing timeout when not uploading
+      if (uploadTimeoutRef.current) {
+        clearTimeout(uploadTimeoutRef.current);
+        uploadTimeoutRef.current = null;
+      }
+      return;
+    }
+
+    // Set up watchdog timer
+    const checkStuck = () => {
+      const timeSinceProgress = Date.now() - lastProgressTime.current;
+      if (timeSinceProgress > UPLOAD_TIMEOUT_MS) {
+        console.error(`[Upload] Stuck detected - no progress for ${timeSinceProgress}ms, forcing reset`);
+
+        // Report to error tracking
+        reportError({
+          type: "upload_timeout",
+          message: `Upload stuck - no progress for ${Math.round(timeSinceProgress / 1000)}s`,
+          context: {
+            timeSinceProgressMs: timeSinceProgress,
+            uploadCount: uploads.length,
+            uploads: uploads.map((u) => ({
+              filename: u.filename,
+              status: u.status,
+              percentage: u.percentage,
+            })),
+          },
+        });
+
+        forceReset();
+        // Show error to user
+        showNotification("Upload timed out", "No response from server. Please try again.");
+      } else {
+        // Check again in 5 seconds
+        uploadTimeoutRef.current = setTimeout(checkStuck, 5000);
+      }
+    };
+
+    // Start checking after initial delay
+    uploadTimeoutRef.current = setTimeout(checkStuck, 5000);
+
+    return () => {
+      if (uploadTimeoutRef.current) {
+        clearTimeout(uploadTimeoutRef.current);
+        uploadTimeoutRef.current = null;
+      }
+    };
+  }, [isUploading, forceReset, uploads]);
 
   // Set up screenshot listener
   useEffect(() => {
@@ -153,6 +251,9 @@ function App() {
   };
 
   const handleProgress = useCallback((progress: UploadProgress) => {
+    // Update last progress time - this keeps the watchdog happy
+    lastProgressTime.current = Date.now();
+
     setUploads((prev) => {
       const item: UploadItem = {
         id: progress.file_id,
@@ -181,6 +282,7 @@ function App() {
     }
 
     setIsUploading(true);
+    lastProgressTime.current = Date.now(); // Reset watchdog timer
     console.log("[Upload] Starting upload...");
 
     try {
@@ -244,6 +346,16 @@ function App() {
       // Parse error message - extract human-readable part from JSON if present
       const errorMsg = parseErrorMessage(String(err));
 
+      // Report to error tracking
+      reportError({
+        type: "upload_error",
+        message: errorMsg,
+        stack: err instanceof Error ? err.stack : undefined,
+        context: {
+          fileCount: paths.length,
+        },
+      });
+
       // Mark all pending/uploading items as error
       setUploads((prev) =>
         prev.map((u) =>
@@ -263,46 +375,23 @@ function App() {
   const handleScreenshot = async () => {
     if (isUploading) return;
 
-    setIsUploading(true);
+    // Hide our window so it's not in the screenshot
+    const window = getCurrentWindow();
+    await window.hide();
+
+    // Small delay to ensure window is hidden
+    await new Promise((resolve) => setTimeout(resolve, 200));
 
     try {
-      // Check screen recording permission on macOS
-      try {
-        const hasPermission = await checkScreenRecordingPermission();
+      // Take screenshot using native OS tool (region selection on macOS)
+      const screenshotPath = await invoke<string>("take_screenshot");
 
-        if (!hasPermission) {
-          // Request permission - this opens System Settings
-          await requestScreenRecordingPermission();
-          await showNotification(
-            "Permission required",
-            "Enable Screen Recording for StorageTo in System Settings, then try again."
-          );
-          setIsUploading(false);
-          return;
-        }
-      } catch {
-        // Permission check failed (maybe not on macOS), continue anyway
-      }
-
-      // Hide our window so it's not in the screenshot
-      const window = getCurrentWindow();
-      await window.hide();
-
-      // Small delay to ensure window is hidden
-      await new Promise((resolve) => setTimeout(resolve, 200));
-
-      // Get available monitors
-      const monitors = await getScreenshotableMonitors();
-
-      if (monitors.length === 0) {
-        throw new Error("No monitors found. Please grant Screen Recording permission.");
-      }
-
-      // Capture the primary monitor (first one)
-      const screenshotPath = await getMonitorScreenshot(monitors[0].id);
-
-      // Show window again
+      // Show window again before uploading
       await window.show();
+
+      // Now start the upload process
+      setIsUploading(true);
+      lastProgressTime.current = Date.now(); // Reset watchdog timer
 
       // Upload the screenshot
       const channel = new Channel<UploadProgress>();
@@ -322,16 +411,27 @@ function App() {
     } catch (err) {
       console.error("[Screenshot] Error:", err);
       const rawError = String(err);
-      // Show helpful error for permission issues
-      if (rawError.includes("No monitors") || rawError.includes("permission")) {
-        await showNotification("Screenshot failed", "Grant Screen Recording permission in System Settings.");
-      } else {
-        const errorMsg = parseErrorMessage(rawError);
-        await showNotification("Screenshot failed", errorMsg);
-      }
-      // Show window again
-      const window = getCurrentWindow();
+
+      // Show window again if hidden
       await window.show();
+
+      // "Screenshot cancelled" is user-initiated, not an error
+      if (rawError.includes("cancelled")) {
+        console.log("[Screenshot] User cancelled screenshot");
+        return;
+      }
+
+      // Report to error tracking (but not permission/unsupported errors)
+      if (!rawError.includes("not supported") && !rawError.includes("not yet supported")) {
+        reportError({
+          type: "screenshot_error",
+          message: rawError,
+          stack: err instanceof Error ? err.stack : undefined,
+        });
+      }
+
+      const errorMsg = parseErrorMessage(rawError);
+      await showNotification("Screenshot failed", errorMsg);
     } finally {
       setIsUploading(false);
     }
@@ -533,18 +633,31 @@ function App() {
             </span>
           </div>
 
-          <Tooltip text="Screenshot" position="bottom">
-            <button
-              onClick={handleScreenshot}
-              disabled={isUploading}
-              className="w-8 h-8 flex items-center justify-center rounded-lg bg-[#292524] hover:bg-[#3f3f46] text-[#a8a29e] hover:text-white transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" />
-              </svg>
-            </button>
-          </Tooltip>
+          {isUploading ? (
+            <Tooltip text="Cancel upload" position="bottom">
+              <button
+                onClick={forceReset}
+                className="h-8 px-3 flex items-center justify-center gap-1.5 rounded-lg bg-red-500/20 hover:bg-red-500/30 text-red-400 hover:text-red-300 transition-colors cursor-pointer text-xs font-medium"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+                Cancel
+              </button>
+            </Tooltip>
+          ) : (
+            <Tooltip text="Screenshot" position="bottom">
+              <button
+                onClick={handleScreenshot}
+                className="w-8 h-8 flex items-center justify-center rounded-lg bg-[#292524] hover:bg-[#3f3f46] text-[#a8a29e] hover:text-white transition-colors cursor-pointer"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" />
+                </svg>
+              </button>
+            </Tooltip>
+          )}
         </div>
 
         {/* Drop Zone */}
