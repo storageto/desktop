@@ -27,6 +27,9 @@
     "global-shortcut:allow-unregister",
     "fs:default",
     "fs:allow-read",
-    "screenshots:default"
+    "screenshots:default",
+    "updater:default",
+    "process:allow-restart",
+    "process:allow-exit"
   ]
 }
