@@ -29,7 +29,6 @@
     "fs:allow-read",
     "screenshots:default",
     "updater:default",
-    "process:allow-restart",
-    "process:allow-exit"
+    "process:default"
   ]
 }
