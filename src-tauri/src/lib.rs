@@ -13,7 +13,9 @@ use storage::{
 use tauri::ipc::Channel;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, State, ActivationPolicy};
+use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, State};
+#[cfg(target_os = "macos")]
+use tauri::ActivationPolicy;
 use upload::{
     create_collection, delete_file, mark_collection_ready, upload_file, UploadProgress, UploadResult,
     init_batch, confirm_batch, upload_to_r2, get_batch_size,
