@@ -11,7 +11,7 @@
   },
   "dependencies": {
     "@floating-ui/react": "^0.27.17",
-    "@tauri-apps/api": "^2",
+    "@tauri-apps/api": "^2.9.1",
     "@tauri-apps/plugin-clipboard-manager": "^2",
     "@tauri-apps/plugin-dialog": "^2",
     "@tauri-apps/plugin-fs": "^2",
@@ -19,7 +19,7 @@
     "@tauri-apps/plugin-notification": "^2",
     "@tauri-apps/plugin-opener": "^2",
     "@tauri-apps/plugin-process": "^2.3.1",
-    "@tauri-apps/plugin-updater": "^2.10.0",
+    "@tauri-apps/plugin-updater": "^2.9.0",
     "clsx": "^2.1.1",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
