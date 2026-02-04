@@ -62,6 +62,6 @@ jobs:
           tagName: v__VERSION__
           releaseName: 'Storage.to Desktop v__VERSION__'
           releaseBody: 'Download the installer for your platform below.'
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
