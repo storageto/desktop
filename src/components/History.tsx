@@ -906,7 +906,7 @@ export function History({ items, uploads, onDelete, onClearUploads, onSetPasswor
                     <div className="flex items-center gap-1.5">
                       <p className="text-sm font-medium text-white truncate">
                         {item.filename}
-                        {item.is_collection && item.file_count && (
+                        {item.is_collection && item.file_count != null && item.file_count > 0 && (
                           <span className="text-xs text-[#57534e] ml-1.5">
                             ({item.file_count} files)
                           </span>

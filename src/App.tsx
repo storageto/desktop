@@ -81,9 +81,16 @@ function App() {
   const lastProgressTime = useRef<number>(Date.now());
   const uploadTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Force reset function - nuclear option to unstick the app
-  const forceReset = useCallback(() => {
-    console.log("[Upload] Force reset triggered");
+  // Cancel upload - signals Rust to stop and resets UI
+  const cancelUpload = useCallback(async () => {
+    console.log("[Upload] Cancel requested");
+    // Signal Rust to cancel any in-progress upload
+    try {
+      await invoke("cancel_upload");
+    } catch (e) {
+      console.error("[Upload] Failed to signal cancel:", e);
+    }
+    // Reset UI state
     setIsUploading(false);
     setUploads([]);
     if (uploadTimeoutRef.current) {
@@ -105,7 +112,7 @@ function App() {
       // If we're in an upload state, reset it
       if (isUploading) {
         console.log("[Global] Resetting upload state due to unhandled error");
-        forceReset();
+        cancelUpload();
       }
     };
 
@@ -114,7 +121,7 @@ function App() {
       // If we're in an upload state, reset it
       if (isUploading) {
         console.log("[Global] Resetting upload state due to unhandled rejection");
-        forceReset();
+        cancelUpload();
       }
     };
 
@@ -125,7 +132,7 @@ function App() {
       window.removeEventListener("error", handleError);
       window.removeEventListener("unhandledrejection", handleUnhandledRejection);
     };
-  }, [isUploading, forceReset]);
+  }, [isUploading, cancelUpload]);
 
   // Watchdog: Auto-reset if upload is stuck (no progress for UPLOAD_TIMEOUT_MS)
   useEffect(() => {
@@ -159,7 +166,7 @@ function App() {
           },
         });
 
-        forceReset();
+        cancelUpload();
         // Show error to user
         showNotification("Upload timed out", "No response from server. Please try again.");
       } else {
@@ -177,7 +184,7 @@ function App() {
         uploadTimeoutRef.current = null;
       }
     };
-  }, [isUploading, forceReset, uploads]);
+  }, [isUploading, cancelUpload, uploads]);
 
   // Set up screenshot listener
   useEffect(() => {
@@ -663,7 +670,7 @@ function App() {
           {isUploading ? (
             <Tooltip text="Cancel upload" position="bottom">
               <button
-                onClick={forceReset}
+                onClick={cancelUpload}
                 className="h-8 px-3 flex items-center justify-center gap-1.5 rounded-lg bg-red-500/20 hover:bg-red-500/30 text-red-400 hover:text-red-300 transition-colors cursor-pointer text-xs font-medium"
               >
                 <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">

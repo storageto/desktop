@@ -5,6 +5,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use storage::{
     clear_history, get_history, load_config, save_config, AppConfig, UploadHistoryItem,
@@ -27,13 +28,37 @@ use uuid::Uuid;
 
 struct AppState {
     config: Mutex<AppConfig>,
+    /// Flag to signal upload cancellation - checked between files/chunks
+    upload_cancelled: Arc<AtomicBool>,
+}
+
+/// Cancel any in-progress upload
+#[tauri::command]
+fn cancel_upload(state: State<AppState>) {
+    eprintln!("[Upload] Cancel requested");
+    state.upload_cancelled.store(true, Ordering::SeqCst);
+}
+
+/// Check if upload was cancelled
+fn is_cancelled(cancel_flag: &Arc<AtomicBool>) -> bool {
+    cancel_flag.load(Ordering::SeqCst)
 }
 
 #[tauri::command]
 async fn upload_single_file(
     path: String,
     on_progress: Channel<UploadProgress>,
+    state: State<'_, AppState>,
 ) -> Result<UploadResult, String> {
+    // Reset cancel flag at start of new upload
+    state.upload_cancelled.store(false, Ordering::SeqCst);
+    let cancel_flag = state.upload_cancelled.clone();
+
+    // Check if cancelled before starting
+    if is_cancelled(&cancel_flag) {
+        return Err("Upload cancelled".to_string());
+    }
+
     upload_file(path, None, on_progress, None).await
 }
 
@@ -52,15 +77,23 @@ struct FileInfo {
 async fn upload_files(
     paths: Vec<String>,
     on_progress: Channel<UploadProgress>,
+    state: State<'_, AppState>,
 ) -> Result<Vec<UploadResult>, String> {
+    // Reset cancel flag at start of new upload
+    state.upload_cancelled.store(false, Ordering::SeqCst);
+    let cancel_flag = state.upload_cancelled.clone();
+
     // Single file - upload directly (no batch needed)
     if paths.len() == 1 {
+        if is_cancelled(&cancel_flag) {
+            return Err("Upload cancelled".to_string());
+        }
         let result = upload_file(paths[0].clone(), None, on_progress, None).await?;
         return Ok(vec![result]);
     }
 
     // Multiple files - use batch upload
-    upload_files_batch(paths, on_progress).await
+    upload_files_batch(paths, on_progress, cancel_flag).await
 }
 
 /// Upload multiple files using batch API endpoints (much more efficient)
@@ -68,8 +101,14 @@ async fn upload_files(
 async fn upload_files_batch(
     paths: Vec<String>,
     on_progress: Channel<UploadProgress>,
+    cancel_flag: Arc<AtomicBool>,
 ) -> Result<Vec<UploadResult>, String> {
     let batch_size = get_batch_size();
+
+    // Check cancellation at start
+    if is_cancelled(&cancel_flag) {
+        return Err("Upload cancelled".to_string());
+    }
 
     // Generate a temporary collection ID for UI grouping before API call
     let temp_collection_id = Uuid::new_v4().to_string();
@@ -121,6 +160,12 @@ async fn upload_files_batch(
     let mut total_size: u64 = 0;
 
     for (batch_index, batch) in file_infos.chunks(batch_size).enumerate() {
+        // Check cancellation before each batch
+        if is_cancelled(&cancel_flag) {
+            eprintln!("[Batch] Upload cancelled before batch {}", batch_index + 1);
+            return Err("Upload cancelled".to_string());
+        }
+
         eprintln!("[Batch] Processing batch {} ({} files)", batch_index + 1, batch.len());
 
         // Step 3a: Init batch - get presigned URLs for all files in this batch
@@ -163,16 +208,39 @@ async fn upload_files_batch(
             let progress = on_progress.clone();
             let coll_id = collection_id_for_progress.clone();
             let coll_name = collection_name.clone();
+            let cancel = cancel_flag.clone();
 
             handles.push(tokio::spawn(async move {
                 let mut uploaded: Vec<(usize, String, String, String, u64)> = Vec::new(); // (idx, filename, content_type, r2_key, size)
                 loop {
+                    // Check cancellation before processing next file
+                    if cancel.load(Ordering::SeqCst) {
+                        eprintln!("[Batch] Worker detected cancellation");
+                        break;
+                    }
+
                     let item = {
                         let mut rx = rx.lock().await;
                         rx.recv().await
                     };
                     match item {
                         Some((idx, file_info, upload_url, r2_key)) => {
+                            // Check cancellation again before starting upload
+                            if cancel.load(Ordering::SeqCst) {
+                                eprintln!("[Batch] Upload of {} cancelled", file_info.filename);
+                                let _ = progress.send(UploadProgress {
+                                    file_id: file_info.file_id.clone(),
+                                    filename: file_info.filename.clone(),
+                                    bytes_uploaded: 0,
+                                    total_bytes: file_info.size,
+                                    percentage: 0.0,
+                                    status: "cancelled".to_string(),
+                                    collection_id: Some(coll_id.clone()),
+                                    collection_name: Some(coll_name.clone()),
+                                });
+                                break;
+                            }
+
                             let path = Path::new(&file_info.path);
 
                             // Update status to uploading
@@ -290,12 +358,19 @@ async fn upload_files_batch(
         }
     }
 
+    // Check if upload was cancelled and no files were uploaded
+    let file_count = all_results.len() as u32;
+    if file_count == 0 {
+        // Delete the empty collection from API
+        eprintln!("[Batch] No files uploaded, deleting empty collection {}", collection_id);
+        let _ = delete_file(collection_id.clone(), true).await;
+        return Err("Upload cancelled".to_string());
+    }
+
     // Step 4: Mark collection ready
     let final_collection = mark_collection_ready(collection_id.clone()).await?;
 
-    // Step 5: Add to history
-    let file_count = all_results.len() as u32;
-
+    // Step 5: Add to history (only if files were uploaded)
     let expires_at = final_collection.expires_at.as_ref().and_then(|s| {
         chrono::DateTime::parse_from_rfc3339(s)
             .ok()
@@ -310,25 +385,28 @@ async fn upload_files_batch(
         uploaded_at: Utc::now(),
         is_collection: true,
         file_count: Some(file_count),
-        files: Some(collection_files),
+        files: Some(collection_files.clone()),
         password_protected: None,
         burn_after_reading: None,
         expires_at,
     };
     let _ = add_to_history(history_item);
 
-    // Send complete status for all files
+    // Send complete status for uploaded files only
     for file_info in &file_infos {
-        let _ = on_progress.send(UploadProgress {
-            file_id: file_info.file_id.clone(),
-            filename: file_info.filename.clone(),
-            bytes_uploaded: file_info.size,
-            total_bytes: file_info.size,
-            percentage: 100.0,
-            status: "complete".to_string(),
-            collection_id: Some(collection_id.clone()),
-            collection_name: Some(collection_name.clone()),
-        });
+        // Only mark as complete if the file was actually uploaded
+        if collection_files.iter().any(|f| f.filename == file_info.filename) {
+            let _ = on_progress.send(UploadProgress {
+                file_id: file_info.file_id.clone(),
+                filename: file_info.filename.clone(),
+                bytes_uploaded: file_info.size,
+                total_bytes: file_info.size,
+                percentage: 100.0,
+                status: "complete".to_string(),
+                collection_id: Some(collection_id.clone()),
+                collection_name: Some(collection_name.clone()),
+            });
+        }
     }
 
     // Return collection result
@@ -347,7 +425,12 @@ async fn upload_files_batch(
 async fn upload_folder(
     folder_path: String,
     on_progress: Channel<UploadProgress>,
+    state: State<'_, AppState>,
 ) -> Result<UploadResult, String> {
+    // Reset cancel flag at start of new upload
+    state.upload_cancelled.store(false, Ordering::SeqCst);
+    let cancel_flag = state.upload_cancelled.clone();
+
     let path = Path::new(&folder_path);
 
     // Check if it's a regular file first (DMG, ISO, etc. can appear as directories on macOS)
@@ -428,6 +511,12 @@ async fn upload_folder(
     let mut success_count: u32 = 0;
 
     for (batch_index, batch) in file_infos.chunks(batch_size).enumerate() {
+        // Check cancellation before each batch
+        if is_cancelled(&cancel_flag) {
+            eprintln!("[Batch] Folder upload cancelled before batch {}", batch_index + 1);
+            return Err("Upload cancelled".to_string());
+        }
+
         eprintln!("[Batch] Processing batch {} ({} files)", batch_index + 1, batch.len());
 
         // Init batch
@@ -467,16 +556,39 @@ async fn upload_folder(
             let progress = on_progress.clone();
             let coll_id = collection_id_for_progress.clone();
             let coll_name = folder_name.clone();
+            let cancel = cancel_flag.clone();
 
             handles.push(tokio::spawn(async move {
                 let mut uploaded: Vec<(usize, String, String, String, u64)> = Vec::new();
                 loop {
+                    // Check cancellation before processing next file
+                    if cancel.load(Ordering::SeqCst) {
+                        eprintln!("[Batch] Folder worker detected cancellation");
+                        break;
+                    }
+
                     let item = {
                         let mut rx = rx.lock().await;
                         rx.recv().await
                     };
                     match item {
                         Some((idx, file_info, upload_url, r2_key)) => {
+                            // Check cancellation again before starting upload
+                            if cancel.load(Ordering::SeqCst) {
+                                eprintln!("[Batch] Upload of {} cancelled", file_info.filename);
+                                let _ = progress.send(UploadProgress {
+                                    file_id: file_info.file_id.clone(),
+                                    filename: file_info.filename.clone(),
+                                    bytes_uploaded: 0,
+                                    total_bytes: file_info.size,
+                                    percentage: 0.0,
+                                    status: "cancelled".to_string(),
+                                    collection_id: Some(coll_id.clone()),
+                                    collection_name: Some(coll_name.clone()),
+                                });
+                                break;
+                            }
+
                             let path = Path::new(&file_info.path);
 
                             let _ = progress.send(UploadProgress {
@@ -584,10 +696,18 @@ async fn upload_folder(
         }
     }
 
+    // Check if upload was cancelled and no files were uploaded
+    if success_count == 0 {
+        // Delete the empty collection from API
+        eprintln!("[Batch] No files uploaded to folder, deleting empty collection {}", collection_id);
+        let _ = delete_file(collection_id.clone(), true).await;
+        return Err("Upload cancelled".to_string());
+    }
+
     // Mark collection ready
     let final_collection = mark_collection_ready(collection_id.clone()).await?;
 
-    // Add to history
+    // Add to history (only if files were uploaded)
     let expires_at = final_collection.expires_at.as_ref().and_then(|s| {
         chrono::DateTime::parse_from_rfc3339(s)
             .ok()
@@ -602,25 +722,27 @@ async fn upload_folder(
         uploaded_at: Utc::now(),
         is_collection: true,
         file_count: Some(success_count),
-        files: Some(collection_files),
+        files: Some(collection_files.clone()),
         password_protected: None,
         burn_after_reading: None,
         expires_at,
     };
     let _ = add_to_history(history_item);
 
-    // Send complete status
+    // Send complete status for uploaded files only
     for file_info in &file_infos {
-        let _ = on_progress.send(UploadProgress {
-            file_id: file_info.file_id.clone(),
-            filename: file_info.filename.clone(),
-            bytes_uploaded: file_info.size,
-            total_bytes: file_info.size,
-            percentage: 100.0,
-            status: "complete".to_string(),
-            collection_id: Some(collection_id.clone()),
-            collection_name: Some(folder_name.clone()),
-        });
+        if collection_files.iter().any(|f| f.filename == file_info.filename) {
+            let _ = on_progress.send(UploadProgress {
+                file_id: file_info.file_id.clone(),
+                filename: file_info.filename.clone(),
+                bytes_uploaded: file_info.size,
+                total_bytes: file_info.size,
+                percentage: 100.0,
+                status: "complete".to_string(),
+                collection_id: Some(collection_id.clone()),
+                collection_name: Some(folder_name.clone()),
+            });
+        }
     }
 
     Ok(UploadResult {
@@ -919,6 +1041,7 @@ pub fn run() {
 
     builder.manage(AppState {
             config: Mutex::new(config),
+            upload_cancelled: Arc::new(AtomicBool::new(false)),
         })
         .setup(|app| {
             // Hide dock icon - this is a menu bar app only
@@ -1022,6 +1145,7 @@ pub fn run() {
             upload_single_file,
             upload_files,
             upload_folder,
+            cancel_upload,
             get_upload_history,
             clear_upload_history,
             delete_uploaded_file,
