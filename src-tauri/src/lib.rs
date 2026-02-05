@@ -9,6 +9,7 @@ use std::sync::Arc;
 use storage::{
     clear_history, get_history, load_config, save_config, AppConfig, UploadHistoryItem,
     add_to_history, remove_from_history, CollectionFileItem, check_first_launch,
+    get_visitor_token, get_api_url,
 };
 use tauri::ipc::Channel;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
@@ -783,6 +784,65 @@ fn update_config(state: State<AppState>, config: AppConfig) -> Result<(), String
     save_config(&config)
 }
 
+/// Get the visitor token from Rust storage (exposes to frontend)
+#[tauri::command]
+fn get_visitor_token_command() -> Option<String> {
+    get_visitor_token()
+}
+
+/// Send analytics event to API
+async fn send_analytics_event(event: &str, context: Option<serde_json::Value>) {
+    let api_url = get_api_url();
+    let visitor_token = get_visitor_token();
+    let version = env!("CARGO_PKG_VERSION");
+
+    let client = reqwest::Client::new();
+    let mut body = serde_json::json!({
+        "app": "desktop",
+        "version": version,
+        "event": event,
+    });
+
+    if let Some(ctx) = context {
+        body["context"] = ctx;
+    }
+
+    let mut request = client
+        .post(format!("{}/api/app-analytics", api_url))
+        .json(&body);
+
+    if let Some(token) = visitor_token {
+        request = request.header("X-Visitor-Token", token);
+    }
+
+    // Fire and forget - we don't care about the result for heartbeats
+    let _ = request.send().await;
+}
+
+/// Start the background heartbeat task
+fn start_heartbeat_task() {
+    tokio::spawn(async {
+        let interval_secs = 60 * 60; // 60 minutes
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;
+
+            let os = if cfg!(target_os = "macos") {
+                "macos"
+            } else if cfg!(target_os = "windows") {
+                "windows"
+            } else {
+                "linux"
+            };
+
+            send_analytics_event("heartbeat", Some(serde_json::json!({
+                "os": os,
+            }))).await;
+
+            eprintln!("[Analytics] Heartbeat sent");
+        }
+    });
+}
+
 // Screenshot is now handled via tauri-plugin-screenshots on the frontend
 
 fn show_window_at_tray(app: &AppHandle, tray_x: f64, tray_y: f64, tray_width: f64, tray_height: f64) {
@@ -950,6 +1010,10 @@ pub fn run() {
             // Keep tray reference alive
             let _ = tray;
 
+            // Start background heartbeat task (runs in Rust, not affected by window visibility)
+            start_heartbeat_task();
+            eprintln!("[Analytics] Background heartbeat started");
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -968,6 +1032,7 @@ pub fn run() {
             get_config,
             update_config,
             take_screenshot,
+            get_visitor_token_command,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

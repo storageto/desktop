@@ -3,15 +3,18 @@
  *
  * Tracks app usage events like launches, uploads, and screenshots.
  * Queues events locally and sends to API with retry logic.
+ *
+ * NOTE: Heartbeat is handled by Rust backend (see lib.rs) since JavaScript
+ * setInterval doesn't fire reliably when the Tauri window is hidden (menu bar app).
  */
 
 import { getVersion } from "@tauri-apps/api/app";
+import { invoke } from "@tauri-apps/api/core";
 
 const API_URL = "https://storage.to/api/app-analytics";
 const MAX_QUEUE_SIZE = 100;
 const RETRY_DELAY_MS = 5000;
 const MAX_RETRIES = 3;
-const HEARTBEAT_INTERVAL_MS = 60 * 60 * 1000; // 60 minutes
 
 interface AnalyticsEvent {
   app: "desktop";
@@ -28,7 +31,6 @@ let isProcessingQueue = false;
 let appVersion: string | null = null;
 let osInfo: { platform: string } | null = null;
 let visitorToken: string | null = null;
-let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
 
 /**
  * Get OS info from userAgent (simple approach without extra plugin)
@@ -42,12 +44,13 @@ function getOsFromUserAgent(): { platform: string } {
 }
 
 /**
- * Get visitor token from localStorage (set by Rust backend)
+ * Get visitor token from Rust storage via Tauri command
  */
-function getVisitorTokenFromStorage(): string | null {
+async function getVisitorTokenFromRust(): Promise<string | null> {
   try {
-    return localStorage.getItem("visitor_token");
-  } catch {
+    return await invoke<string | null>("get_visitor_token_command");
+  } catch (e) {
+    console.warn("[Analytics] Failed to get visitor token from Rust:", e);
     return null;
   }
 }
@@ -66,8 +69,8 @@ export async function initAnalyticsReporter(): Promise<void> {
   // Get OS info from userAgent
   osInfo = getOsFromUserAgent();
 
-  // Get visitor token
-  visitorToken = getVisitorTokenFromStorage();
+  // Get visitor token from Rust storage
+  visitorToken = await getVisitorTokenFromRust();
 
   // Load any queued events from previous session
   loadQueueFromStorage();
@@ -80,27 +83,10 @@ export async function initAnalyticsReporter(): Promise<void> {
     os: osInfo?.platform,
   });
 
-  // Start heartbeat
-  startHeartbeat();
+  // NOTE: Heartbeat is handled by Rust backend (lib.rs) since JavaScript
+  // setInterval doesn't fire reliably when the Tauri window is hidden
 
-  console.log("[Analytics] Initialized");
-}
-
-/**
- * Start the heartbeat interval
- */
-function startHeartbeat(): void {
-  // Clear any existing interval
-  if (heartbeatInterval) {
-    clearInterval(heartbeatInterval);
-  }
-
-  // Send heartbeat every 60 minutes
-  heartbeatInterval = setInterval(() => {
-    trackEvent("heartbeat", {
-      os: osInfo?.platform,
-    });
-  }, HEARTBEAT_INTERVAL_MS);
+  console.log("[Analytics] Initialized with visitor token:", visitorToken?.substring(0, 8) + "...");
 }
 
 /**
@@ -171,7 +157,7 @@ async function processQueue(): Promise<void> {
 
   // Refresh visitor token in case it was set after init
   if (!visitorToken) {
-    visitorToken = getVisitorTokenFromStorage();
+    visitorToken = await getVisitorTokenFromRust();
   }
 
   while (eventQueue.length > 0) {
