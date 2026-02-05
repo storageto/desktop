@@ -819,9 +819,11 @@ async fn send_analytics_event(event: &str, context: Option<serde_json::Value>) {
     let _ = request.send().await;
 }
 
-/// Start the background heartbeat task
+/// Start the background heartbeat task using Tauri's async runtime
 fn start_heartbeat_task() {
-    tokio::spawn(async {
+    // Use tauri::async_runtime::spawn instead of tokio::spawn
+    // This properly integrates with Tauri's runtime during setup
+    tauri::async_runtime::spawn(async {
         let interval_secs = 60 * 60; // 60 minutes
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;
