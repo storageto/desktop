@@ -912,6 +912,13 @@ fn get_visitor_token_command() -> Option<String> {
     get_visitor_token()
 }
 
+/// Restart the app to apply a pending update
+#[tauri::command]
+fn restart_app(app: AppHandle) {
+    eprintln!("[Updater] Restarting app to apply update");
+    app.restart();
+}
+
 /// Send analytics event to API
 async fn send_analytics_event(event: &str, context: Option<serde_json::Value>) {
     let api_url = get_api_url();
@@ -963,6 +970,65 @@ fn start_heartbeat_task() {
             }))).await;
 
             eprintln!("[Analytics] Heartbeat sent");
+        }
+    });
+}
+
+/// Start the background update checker task
+fn start_update_checker(app_handle: AppHandle) {
+    use tauri_plugin_updater::UpdaterExt;
+    use tauri_plugin_notification::NotificationExt;
+
+    tauri::async_runtime::spawn(async move {
+        // Initial delay before first check (let app fully start)
+        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+
+        let check_interval_secs = 60 * 60; // Check every hour
+
+        loop {
+            eprintln!("[Updater] Checking for updates...");
+
+            match app_handle.updater() {
+                Ok(updater) => {
+                    match updater.check().await {
+                        Ok(Some(update)) => {
+                            let version = update.version.clone();
+                            eprintln!("[Updater] Update available: {}", version);
+
+                            // Download the update in background
+                            match update.download_and_install(|_, _| {}, || {}).await {
+                                Ok(_) => {
+                                    eprintln!("[Updater] Update downloaded, showing notification");
+
+                                    // Show notification to user
+                                    let _ = app_handle.notification()
+                                        .builder()
+                                        .title("Update Ready")
+                                        .body(format!("StorageTo v{} downloaded. Restart to apply.", version))
+                                        .show();
+
+                                    // Emit event so frontend knows update is ready
+                                    let _ = app_handle.emit("update-ready", version);
+                                }
+                                Err(e) => {
+                                    eprintln!("[Updater] Failed to download update: {}", e);
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            eprintln!("[Updater] No update available");
+                        }
+                        Err(e) => {
+                            eprintln!("[Updater] Failed to check for updates: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[Updater] Failed to get updater: {}", e);
+                }
+            }
+
+            tokio::time::sleep(tokio::time::Duration::from_secs(check_interval_secs)).await;
         }
     });
 }
@@ -1139,6 +1205,10 @@ pub fn run() {
             start_heartbeat_task();
             eprintln!("[Analytics] Background heartbeat started");
 
+            // Start background update checker
+            start_update_checker(app.handle().clone());
+            eprintln!("[Updater] Background update checker started");
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1159,6 +1229,7 @@ pub fn run() {
             update_config,
             take_screenshot,
             get_visitor_token_command,
+            restart_app,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

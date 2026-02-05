@@ -75,6 +75,7 @@ function App() {
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [isUploading, setIsUploading] = useState(false);
   const [appVersion, setAppVersion] = useState<string | null>(null);
+  const [updateReady, setUpdateReady] = useState<string | null>(null);
   const { toasts, addToast, dismissToast } = useToast();
 
   // Track last progress update time to detect stuck uploads
@@ -103,6 +104,27 @@ function App() {
   useEffect(() => {
     loadHistory();
     getVersion().then(setAppVersion).catch(() => {});
+  }, []);
+
+  // Listen for update-ready event from Rust
+  useEffect(() => {
+    const unlisten = listen<string>("update-ready", (event) => {
+      console.log("[Updater] Update ready:", event.payload);
+      setUpdateReady(event.payload);
+    });
+
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  // Handle restart to apply update
+  const handleRestartForUpdate = useCallback(async () => {
+    try {
+      await invoke("restart_app");
+    } catch (e) {
+      console.error("[Updater] Failed to restart:", e);
+    }
   }, []);
 
   // Global error handler - catch any unhandled errors and reset state
@@ -664,6 +686,16 @@ function App() {
               <span className="text-[10px] text-stone-500" data-tauri-drag-region>
                 v{appVersion}
               </span>
+            )}
+            {updateReady && (
+              <Tooltip text={`v${updateReady} ready - click to restart`} position="bottom">
+                <button
+                  onClick={handleRestartForUpdate}
+                  className="ml-1 px-1.5 py-0.5 text-[10px] font-medium bg-pink-500/20 text-pink-400 hover:bg-pink-500/30 hover:text-pink-300 rounded transition-colors cursor-pointer"
+                >
+                  Update
+                </button>
+              </Tooltip>
             )}
           </div>
 
