@@ -42,6 +42,12 @@ pub struct AppConfig {
     pub show_notifications: bool,
     #[serde(default)]
     pub has_launched: bool,
+    #[serde(default)]
+    pub default_expiry_days: Option<u32>,
+    #[serde(default)]
+    pub screenshot_shortcut: Option<String>,
+    #[serde(default)]
+    pub auth_token: Option<String>,
 }
 
 impl AppConfig {
@@ -53,6 +59,9 @@ impl AppConfig {
             auto_copy_url: true,
             show_notifications: true,
             has_launched: false,
+            default_expiry_days: None,
+            screenshot_shortcut: None,
+            auth_token: None,
         }
     }
 }
@@ -150,6 +159,10 @@ pub fn set_visitor_token(token: String) -> Result<(), String> {
     let mut config = load_config();
     config.visitor_token = Some(token);
     save_config(&config)
+}
+
+pub fn get_auth_token() -> Option<String> {
+    load_config().auth_token
 }
 
 pub fn get_api_url() -> String {

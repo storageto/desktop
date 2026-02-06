@@ -31,6 +31,7 @@ let isProcessingQueue = false;
 let appVersion: string | null = null;
 let osInfo: { platform: string } | null = null;
 let visitorToken: string | null = null;
+let authToken: string | null = null;
 
 /**
  * Get OS info from userAgent (simple approach without extra plugin)
@@ -56,6 +57,19 @@ async function getVisitorTokenFromRust(): Promise<string | null> {
 }
 
 /**
+ * Get auth token from Rust config via Tauri command
+ */
+async function getAuthTokenFromRust(): Promise<string | null> {
+  try {
+    const config = await invoke<{ auth_token: string | null }>("get_config");
+    return config.auth_token;
+  } catch (e) {
+    console.warn("[Analytics] Failed to get auth token from Rust:", e);
+    return null;
+  }
+}
+
+/**
  * Initialize the analytics reporter - call once at app startup
  */
 export async function initAnalyticsReporter(): Promise<void> {
@@ -69,8 +83,9 @@ export async function initAnalyticsReporter(): Promise<void> {
   // Get OS info from userAgent
   osInfo = getOsFromUserAgent();
 
-  // Get visitor token from Rust storage
+  // Get visitor token and auth token from Rust storage
   visitorToken = await getVisitorTokenFromRust();
+  authToken = await getAuthTokenFromRust();
 
   // Load any queued events from previous session
   loadQueueFromStorage();
@@ -155,10 +170,11 @@ async function processQueue(): Promise<void> {
 
   isProcessingQueue = true;
 
-  // Refresh visitor token in case it was set after init
+  // Refresh tokens in case they were set after init
   if (!visitorToken) {
     visitorToken = await getVisitorTokenFromRust();
   }
+  authToken = await getAuthTokenFromRust();
 
   while (eventQueue.length > 0) {
     const event = eventQueue[0];
@@ -166,11 +182,17 @@ async function processQueue(): Promise<void> {
     try {
       const headers: Record<string, string> = {
         "Content-Type": "application/json",
+        "Accept": "application/json",
       };
 
       // Add visitor token if available
       if (visitorToken) {
         headers["X-Visitor-Token"] = visitorToken;
+      }
+
+      // Add auth token if logged in
+      if (authToken) {
+        headers["Authorization"] = `Bearer ${authToken}`;
       }
 
       const response = await fetch(API_URL, {

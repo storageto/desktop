@@ -1,4 +1,4 @@
-use crate::storage::{add_to_history, get_api_url, get_visitor_token, UploadHistoryItem};
+use crate::storage::{add_to_history, get_api_url, get_auth_token, get_visitor_token, UploadHistoryItem};
 use chrono::Utc;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_LENGTH, CONTENT_TYPE};
 use reqwest::Client;
@@ -11,7 +11,7 @@ use std::path::Path;
 use tauri::ipc::Channel;
 use uuid::Uuid;
 
-const CHUNK_SIZE: u64 = 50 * 1024 * 1024; // 50MB chunks
+const CHUNK_SIZE: u64 = 32 * 1024 * 1024; // 32MB chunks (matches API PART_SIZE)
 const BATCH_SIZE: usize = 250; // Max files per batch API call
 
 // Debug logging to file
@@ -191,6 +191,7 @@ struct CompleteMultipartRequest {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct CompletedPart {
     part_number: u32,
     etag: String,
@@ -218,6 +219,12 @@ fn get_headers() -> HeaderMap {
     if let Some(token) = get_visitor_token() {
         if let Ok(value) = HeaderValue::from_str(&token) {
             headers.insert("X-Visitor-Token", value);
+        }
+    }
+
+    if let Some(auth_token) = get_auth_token() {
+        if let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", auth_token)) {
+            headers.insert("Authorization", value);
         }
     }
 
@@ -280,6 +287,7 @@ pub async fn init_batch(files: Vec<BatchFileRequest>) -> Result<std::collections
 }
 
 /// Confirm multiple uploads in a single API call (max 250 files per batch)
+/// Retries up to 3 times with exponential backoff on network/server errors.
 pub async fn confirm_batch(
     collection_id: Option<String>,
     files: Vec<BatchConfirmFile>,
@@ -294,30 +302,48 @@ pub async fn confirm_batch(
         files,
     };
 
-    let response = client
-        .post(format!("{}/api/upload/confirm-batch", api_url))
-        .headers(get_headers())
-        .json(&request)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to confirm batch: {}", e))?;
+    let mut last_error = String::new();
+    for attempt in 0u32..3 {
+        if attempt > 0 {
+            debug_log(&format!("[Batch] Retrying confirm-batch (attempt {})", attempt + 1));
+            tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)).await;
+        }
 
-    if !response.status().is_success() {
-        let error_text = response.text().await.unwrap_or_default();
-        debug_log(&format!("[Batch] Confirm batch failed: {}", error_text));
-        return Err(format!("Confirm batch failed: {}", error_text));
+        let response = match client
+            .post(format!("{}/api/upload/confirm-batch", api_url))
+            .headers(get_headers())
+            .json(&request)
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                last_error = format!("Failed to confirm batch: {}", e);
+                debug_log(&format!("[Batch] {}", last_error));
+                continue;
+            }
+        };
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            last_error = format!("Confirm batch failed: {}", error_text);
+            debug_log(&format!("[Batch] {}", last_error));
+            continue;
+        }
+
+        let data: ConfirmBatchResponse = response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse confirm-batch response: {}", e))?;
+
+        if !data.success {
+            return Err(data.error.unwrap_or_else(|| "Unknown error".to_string()));
+        }
+
+        return data.results.ok_or_else(|| "No results in confirm-batch response".to_string());
     }
 
-    let data: ConfirmBatchResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse confirm-batch response: {}", e))?;
-
-    if !data.success {
-        return Err(data.error.unwrap_or_else(|| "Unknown error".to_string()));
-    }
-
-    data.results.ok_or_else(|| "No results in confirm-batch response".to_string())
+    Err(last_error)
 }
 
 /// Upload a single file directly to R2 using a presigned URL (no API calls, just R2)
@@ -332,6 +358,36 @@ pub async fn upload_to_r2(
     collection_name: Option<String>,
 ) -> Result<(), String> {
     upload_single(get_client(), upload_url, path, size, file_id, filename, on_progress, collection_id, collection_name).await
+}
+
+/// Upload a large file to R2 using multipart upload (no init/confirm API calls, just R2 parts + complete)
+pub async fn upload_multipart_to_r2(
+    path: &Path,
+    upload_id: &str,
+    r2_key: &str,
+    size: u64,
+    initial_urls: std::collections::HashMap<String, String>,
+    file_id: &str,
+    filename: &str,
+    on_progress: &Channel<UploadProgress>,
+    collection_id: Option<String>,
+    collection_name: Option<String>,
+) -> Result<(), String> {
+    upload_multipart_v2(
+        get_client(),
+        &get_api_url(),
+        path,
+        upload_id,
+        r2_key,
+        size,
+        initial_urls,
+        file_id,
+        filename,
+        on_progress,
+        collection_id,
+        collection_name,
+    )
+    .await
 }
 
 /// Get the BATCH_SIZE constant for external use
@@ -469,6 +525,8 @@ pub async fn upload_file(
             &file_id,
             &filename,
             &on_progress,
+            None,
+            None,
         )
         .await?;
     } else {
@@ -673,102 +731,243 @@ async fn upload_multipart_v2(
     file_id: &str,
     filename: &str,
     on_progress: &Channel<UploadProgress>,
+    collection_id: Option<String>,
+    collection_name: Option<String>,
 ) -> Result<(), String> {
-    let mut file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
+    use std::sync::atomic::AtomicU64;
+    use tokio::io::AsyncReadExt;
+
+    const MAX_CONCURRENT: usize = 4;
+    const MAX_RETRIES: u32 = 3;
+
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| format!("Failed to open file: {}", e))?;
     let mut completed_parts: Vec<CompletedPart> = Vec::new();
-    let mut bytes_uploaded: u64 = 0;
     let mut part_number: u32 = 1;
     let mut part_urls = initial_urls;
 
-    loop {
-        let mut buffer = vec![0u8; CHUNK_SIZE as usize];
-        let bytes_read = file
-            .read(&mut buffer)
-            .map_err(|e| format!("Failed to read file chunk: {}", e))?;
+    // Shared atomic counter for smooth cross-task progress reporting
+    let bytes_uploaded = std::sync::Arc::new(AtomicU64::new(0));
 
-        if bytes_read == 0 {
+    loop {
+        let mut batch: Vec<(u32, Vec<u8>, String)> = Vec::new();
+
+        // Pre-read up to MAX_CONCURRENT parts from disk
+        for _ in 0..MAX_CONCURRENT {
+            let part_start = (part_number as u64 - 1) * CHUNK_SIZE;
+            let part_size = std::cmp::min(CHUNK_SIZE, total_size.saturating_sub(part_start)) as usize;
+
+            if part_size == 0 {
+                break;
+            }
+
+            // Read this part into memory
+            let mut buf = vec![0u8; part_size];
+            file.read_exact(&mut buf)
+                .await
+                .map_err(|e| format!("Failed to read part {}: {}", part_number, e))?;
+
+            // Get the URL for this part
+            let part_key = part_number.to_string();
+            let part_url = match part_urls.get(&part_key) {
+                Some(url) => url.clone(),
+                None => {
+                    let more_urls = get_more_parts_v2(client, api_url, upload_id, part_number).await?;
+                    part_urls.extend(more_urls);
+                    part_urls.get(&part_key)
+                        .ok_or_else(|| format!("Missing URL for part {}", part_number))?
+                        .clone()
+                }
+            };
+
+            batch.push((part_number, buf, part_url));
+            part_number += 1;
+        }
+
+        if batch.is_empty() {
             break;
         }
 
-        buffer.truncate(bytes_read);
+        // Spawn concurrent upload tasks
+        let mut join_set = tokio::task::JoinSet::new();
+        for (pn, data, url) in batch {
+            let task_client = client.clone();
+            let progress = bytes_uploaded.clone();
+            let channel = on_progress.clone();
+            let task_file_id = file_id.to_string();
+            let task_filename = filename.to_string();
+            let task_coll_id = collection_id.clone();
+            let task_coll_name = collection_name.clone();
 
-        // Get the URL for this part
-        let part_key = part_number.to_string();
-        let part_url = match part_urls.get(&part_key) {
-            Some(url) => url.clone(),
-            None => {
-                // Get more part URLs if needed
-                let more_urls = get_more_parts_v2(client, api_url, upload_id, part_number).await?;
-                part_urls.extend(more_urls);
-                part_urls.get(&part_key)
-                    .ok_or_else(|| format!("Missing URL for part {}", part_number))?
-                    .clone()
-            }
-        };
-
-        // Upload part
-        let response = client
-            .put(&part_url)
-            .header(CONTENT_LENGTH, bytes_read)
-            .body(buffer)
-            .send()
-            .await
-            .map_err(|e| format!("Failed to upload part {}: {}", part_number, e))?;
-
-        if !response.status().is_success() {
-            return Err(format!("Part {} upload failed", part_number));
+            join_set.spawn(async move {
+                upload_part_with_retry(
+                    &task_client, &url, data, pn,
+                    &progress, total_size,
+                    &channel, &task_file_id, &task_filename,
+                    MAX_RETRIES,
+                    task_coll_id, task_coll_name,
+                ).await
+            });
         }
 
-        // Get ETag from response
-        let etag = response
-            .headers()
-            .get("etag")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.trim_matches('"').to_string())
-            .ok_or_else(|| format!("Missing ETag for part {}", part_number))?;
-
-        completed_parts.push(CompletedPart {
-            part_number,
-            etag,
-        });
-
-        bytes_uploaded += bytes_read as u64;
-        let percentage = (bytes_uploaded as f64 / total_size as f64) * 100.0;
-
-        let _ = on_progress.send(UploadProgress {
-            file_id: file_id.to_string(),
-            filename: filename.to_string(),
-            bytes_uploaded,
-            total_bytes: total_size,
-            percentage,
-            status: "uploading".to_string(),
-            collection_id: None,
-            collection_name: None,
-        });
-
-        part_number += 1;
+        // Collect results from this batch
+        while let Some(result) = join_set.join_next().await {
+            let part = result
+                .map_err(|e| format!("Upload task panicked: {}", e))?
+                .map_err(|e| format!("Upload failed: {}", e))?;
+            completed_parts.push(part);
+        }
     }
 
-    // Complete multipart upload
+    // Sort parts by part_number before completing
+    completed_parts.sort_by_key(|p| p.part_number);
+
+    // Complete multipart upload (with retry)
     let complete_request = CompleteMultipartRequest {
         upload_id: upload_id.to_string(),
         parts: completed_parts,
     };
 
-    let complete_response = client
-        .post(format!("{}/api/upload/complete-multipart", api_url))
-        .headers(get_headers())
-        .json(&complete_request)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to complete multipart upload: {}", e))?;
+    let mut last_error = String::new();
+    for attempt in 0u32..3 {
+        if attempt > 0 {
+            debug_log(&format!("[Multipart] Retrying complete-multipart (attempt {})", attempt + 1));
+            tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)).await;
+        }
 
-    if !complete_response.status().is_success() {
-        let error_text = complete_response.text().await.unwrap_or_default();
-        return Err(format!("Complete multipart failed: {}", error_text));
+        let resp = match client
+            .post(format!("{}/api/upload/complete-multipart", api_url))
+            .headers(get_headers())
+            .json(&complete_request)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                last_error = format!("Failed to complete multipart upload: {}", e);
+                debug_log(&format!("[Multipart] {}", last_error));
+                continue;
+            }
+        };
+
+        if !resp.status().is_success() {
+            let error_text = resp.text().await.unwrap_or_default();
+            last_error = format!("Complete multipart failed: {}", error_text);
+            debug_log(&format!("[Multipart] {}", last_error));
+            continue;
+        }
+
+        return Ok(());
     }
 
-    Ok(())
+    Err(last_error)
+}
+
+/// Upload a single part with retry (up to max_retries attempts, exponential backoff)
+async fn upload_part_with_retry(
+    client: &Client,
+    url: &str,
+    data: Vec<u8>,
+    part_number: u32,
+    bytes_uploaded: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    total_size: u64,
+    on_progress: &Channel<UploadProgress>,
+    file_id: &str,
+    filename: &str,
+    max_retries: u32,
+    collection_id: Option<String>,
+    collection_name: Option<String>,
+) -> Result<CompletedPart, String> {
+    use std::sync::atomic::Ordering;
+
+    let part_size = data.len();
+    let stream_chunk_size = 256 * 1024usize;
+
+    for attempt in 0..max_retries {
+        // Stream the buffer in 256KB pieces for progress reporting
+        let progress = bytes_uploaded.clone();
+        let channel = on_progress.clone();
+        let p_file_id = file_id.to_string();
+        let p_filename = filename.to_string();
+        let p_coll_id = collection_id.clone();
+        let p_coll_name = collection_name.clone();
+        let data_clone = data.clone();
+
+        let stream = async_stream::stream! {
+            let mut offset = 0usize;
+            while offset < data_clone.len() {
+                let end = std::cmp::min(offset + stream_chunk_size, data_clone.len());
+                let chunk = &data_clone[offset..end];
+                let chunk_len = chunk.len() as u64;
+
+                let sent = progress.fetch_add(chunk_len, Ordering::Relaxed) + chunk_len;
+                let pct = (sent as f64 / total_size as f64) * 100.0;
+
+                let _ = channel.send(UploadProgress {
+                    file_id: p_file_id.clone(),
+                    filename: p_filename.clone(),
+                    bytes_uploaded: sent,
+                    total_bytes: total_size,
+                    percentage: pct,
+                    status: "uploading".to_string(),
+                    collection_id: p_coll_id.clone(),
+                    collection_name: p_coll_name.clone(),
+                });
+
+                yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(chunk));
+                offset = end;
+            }
+        };
+
+        let body = reqwest::Body::wrap_stream(stream);
+
+        match client
+            .put(url)
+            .header(CONTENT_LENGTH, part_size)
+            .body(body)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {
+                let etag = response
+                    .headers()
+                    .get("etag")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.trim_matches('"').to_string())
+                    .ok_or_else(|| format!("Missing ETag for part {}", part_number))?;
+
+                return Ok(CompletedPart { part_number, etag });
+            }
+            Ok(response) => {
+                let status = response.status();
+                debug_log(&format!(
+                    "[Multipart] Part {} attempt {}/{} failed with status {}",
+                    part_number, attempt + 1, max_retries, status
+                ));
+                // Roll back progress for retry
+                bytes_uploaded.fetch_sub(part_size as u64, std::sync::atomic::Ordering::Relaxed);
+                if attempt + 1 >= max_retries {
+                    return Err(format!("Part {} upload failed with status {} after {} attempts", part_number, status, max_retries));
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)).await;
+            }
+            Err(e) => {
+                debug_log(&format!(
+                    "[Multipart] Part {} attempt {}/{} error: {}",
+                    part_number, attempt + 1, max_retries, e
+                ));
+                // Roll back progress for retry
+                bytes_uploaded.fetch_sub(part_size as u64, std::sync::atomic::Ordering::Relaxed);
+                if attempt + 1 >= max_retries {
+                    return Err(format!("Part {} upload failed after {} attempts: {}", part_number, max_retries, e));
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)).await;
+            }
+        }
+    }
+
+    Err(format!("Part {} upload failed after {} attempts", part_number, max_retries))
 }
 
 async fn get_more_parts_v2(
@@ -850,32 +1049,52 @@ pub async fn create_collection(expected_file_count: Option<usize>) -> Result<Col
     resp.collection.ok_or_else(|| "No collection in response".to_string())
 }
 
+/// Retries up to 3 times with exponential backoff on network/server errors.
 pub async fn mark_collection_ready(collection_id: String) -> Result<CollectionInfo, String> {
     let client = get_client();
     let api_url = get_api_url();
 
-    let response = client
-        .post(format!("{}/api/collection/{}/ready", api_url, collection_id))
-        .headers(get_headers())
-        .send()
-        .await
-        .map_err(|e| format!("Failed to mark collection ready: {}", e))?;
+    let mut last_error = String::new();
+    for attempt in 0u32..3 {
+        if attempt > 0 {
+            debug_log(&format!("[Collection] Retrying mark_collection_ready (attempt {})", attempt + 1));
+            tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)).await;
+        }
 
-    if !response.status().is_success() {
-        let error_text = response.text().await.unwrap_or_default();
-        return Err(format!("Mark collection ready failed: {}", error_text));
+        let response = match client
+            .post(format!("{}/api/collection/{}/ready", api_url, collection_id))
+            .headers(get_headers())
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                last_error = format!("Failed to mark collection ready: {}", e);
+                debug_log(&format!("[Collection] {}", last_error));
+                continue;
+            }
+        };
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            last_error = format!("Mark collection ready failed: {}", error_text);
+            debug_log(&format!("[Collection] {}", last_error));
+            continue;
+        }
+
+        let resp: CollectionResponse = response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse collection response: {}", e))?;
+
+        if !resp.success {
+            return Err(resp.error.unwrap_or_else(|| "Unknown error".to_string()));
+        }
+
+        return resp.collection.ok_or_else(|| "No collection in response".to_string());
     }
 
-    let resp: CollectionResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse collection response: {}", e))?;
-
-    if !resp.success {
-        return Err(resp.error.unwrap_or_else(|| "Unknown error".to_string()));
-    }
-
-    resp.collection.ok_or_else(|| "No collection in response".to_string())
+    Err(last_error)
 }
 
 pub async fn delete_file(file_id: String, is_collection: bool) -> Result<(), String> {

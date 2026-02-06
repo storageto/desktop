@@ -1,19 +1,17 @@
-import { useEffect, useState, useCallback, useRef } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { sendNotification, isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 import { DropZone } from "./components/DropZone";
 import { History, HistoryItem, UploadItem } from "./components/History";
+import { Settings } from "./components/Settings";
 import { ToastContainer, useToast } from "./components/Toast";
 import { Tooltip } from "./components/Tooltip";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getVersion } from "@tauri-apps/api/app";
 import { reportError } from "./errorReporter";
 import { trackUploadComplete, trackScreenshotComplete } from "./analyticsReporter";
-
-// Timeout for stuck uploads (60 seconds with no progress = stuck)
-const UPLOAD_TIMEOUT_MS = 60000;
 
 interface UploadProgress {
   file_id: string;
@@ -73,31 +71,25 @@ function parseErrorMessage(rawError: string): string {
 function App() {
   const [uploads, setUploads] = useState<UploadItem[]>([]);
   const [history, setHistory] = useState<HistoryItem[]>([]);
-  const [isUploading, setIsUploading] = useState(false);
   const [appVersion, setAppVersion] = useState<string | null>(null);
   const [updateReady, setUpdateReady] = useState<string | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const { toasts, addToast, dismissToast } = useToast();
 
-  // Track last progress update time to detect stuck uploads
-  const lastProgressTime = useRef<number>(Date.now());
-  const uploadTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Derived: are there active uploads in progress?
+  const hasActiveUploads = uploads.some(
+    (u) => u.status === "queued" || u.status === "initializing" || u.status === "uploading" || u.status === "confirming"
+  );
 
   // Cancel upload - signals Rust to stop and resets UI
   const cancelUpload = useCallback(async () => {
     console.log("[Upload] Cancel requested");
-    // Signal Rust to cancel any in-progress upload
     try {
       await invoke("cancel_upload");
     } catch (e) {
       console.error("[Upload] Failed to signal cancel:", e);
     }
-    // Reset UI state
-    setIsUploading(false);
     setUploads([]);
-    if (uploadTimeoutRef.current) {
-      clearTimeout(uploadTimeoutRef.current);
-      uploadTimeoutRef.current = null;
-    }
   }, []);
 
   // Load history and version on mount
@@ -118,6 +110,17 @@ function App() {
     };
   }, []);
 
+  // Listen for open-settings event from tray menu
+  useEffect(() => {
+    const unlisten = listen("open-settings", () => {
+      setSettingsOpen(true);
+    });
+
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
   // Handle restart to apply update
   const handleRestartForUpdate = useCallback(async () => {
     try {
@@ -126,87 +129,6 @@ function App() {
       console.error("[Updater] Failed to restart:", e);
     }
   }, []);
-
-  // Global error handler - catch any unhandled errors and reset state
-  useEffect(() => {
-    const handleError = (event: ErrorEvent) => {
-      console.error("[Global] Unhandled error:", event.error);
-      // If we're in an upload state, reset it
-      if (isUploading) {
-        console.log("[Global] Resetting upload state due to unhandled error");
-        cancelUpload();
-      }
-    };
-
-    const handleUnhandledRejection = (event: PromiseRejectionEvent) => {
-      console.error("[Global] Unhandled promise rejection:", event.reason);
-      // If we're in an upload state, reset it
-      if (isUploading) {
-        console.log("[Global] Resetting upload state due to unhandled rejection");
-        cancelUpload();
-      }
-    };
-
-    window.addEventListener("error", handleError);
-    window.addEventListener("unhandledrejection", handleUnhandledRejection);
-
-    return () => {
-      window.removeEventListener("error", handleError);
-      window.removeEventListener("unhandledrejection", handleUnhandledRejection);
-    };
-  }, [isUploading, cancelUpload]);
-
-  // Watchdog: Auto-reset if upload is stuck (no progress for UPLOAD_TIMEOUT_MS)
-  useEffect(() => {
-    if (!isUploading) {
-      // Clear any existing timeout when not uploading
-      if (uploadTimeoutRef.current) {
-        clearTimeout(uploadTimeoutRef.current);
-        uploadTimeoutRef.current = null;
-      }
-      return;
-    }
-
-    // Set up watchdog timer
-    const checkStuck = () => {
-      const timeSinceProgress = Date.now() - lastProgressTime.current;
-      if (timeSinceProgress > UPLOAD_TIMEOUT_MS) {
-        console.error(`[Upload] Stuck detected - no progress for ${timeSinceProgress}ms, forcing reset`);
-
-        // Report to error tracking
-        reportError({
-          type: "upload_timeout",
-          message: `Upload stuck - no progress for ${Math.round(timeSinceProgress / 1000)}s`,
-          context: {
-            timeSinceProgressMs: timeSinceProgress,
-            uploadCount: uploads.length,
-            uploads: uploads.map((u) => ({
-              filename: u.filename,
-              status: u.status,
-              percentage: u.percentage,
-            })),
-          },
-        });
-
-        cancelUpload();
-        // Show error to user
-        showNotification("Upload timed out", "No response from server. Please try again.");
-      } else {
-        // Check again in 5 seconds
-        uploadTimeoutRef.current = setTimeout(checkStuck, 5000);
-      }
-    };
-
-    // Start checking after initial delay
-    uploadTimeoutRef.current = setTimeout(checkStuck, 5000);
-
-    return () => {
-      if (uploadTimeoutRef.current) {
-        clearTimeout(uploadTimeoutRef.current);
-        uploadTimeoutRef.current = null;
-      }
-    };
-  }, [isUploading, cancelUpload, uploads]);
 
   // Set up screenshot listener
   useEffect(() => {
@@ -284,9 +206,6 @@ function App() {
   };
 
   const handleProgress = useCallback((progress: UploadProgress) => {
-    // Update last progress time - this keeps the watchdog happy
-    lastProgressTime.current = Date.now();
-
     setUploads((prev) => {
       const item: UploadItem = {
         id: progress.file_id,
@@ -308,15 +227,7 @@ function App() {
   }, []);
 
   const handleFilesSelected = async (paths: string[]) => {
-    console.log("[Upload] handleFilesSelected called, isUploading:", isUploading, "paths:", paths);
-    if (isUploading) {
-      console.log("[Upload] Blocked - already uploading");
-      return;
-    }
-
-    setIsUploading(true);
-    lastProgressTime.current = Date.now(); // Reset watchdog timer
-    console.log("[Upload] Starting upload...");
+    console.log("[Upload] handleFilesSelected called, paths:", paths);
 
     try {
       // First, try as folder upload (Rust will check if it's actually a directory)
@@ -414,15 +325,10 @@ function App() {
       );
 
       await showNotification("Upload failed", errorMsg);
-    } finally {
-      console.log("[Upload] Finally block - resetting isUploading to false");
-      setIsUploading(false);
     }
   };
 
   const handleScreenshot = async () => {
-    if (isUploading) return;
-
     // Hide our window so it's not in the screenshot
     const window = getCurrentWindow();
     await window.hide();
@@ -436,10 +342,6 @@ function App() {
 
       // Show window again before uploading
       await window.show();
-
-      // Now start the upload process
-      setIsUploading(true);
-      lastProgressTime.current = Date.now(); // Reset watchdog timer
 
       // Upload the screenshot
       const channel = new Channel<UploadProgress>();
@@ -483,8 +385,6 @@ function App() {
 
       const errorMsg = parseErrorMessage(rawError);
       await showNotification("Screenshot failed", errorMsg);
-    } finally {
-      setIsUploading(false);
     }
   };
 
@@ -703,47 +603,70 @@ function App() {
             )}
           </div>
 
-          {isUploading ? (
-            <Tooltip text="Cancel upload" position="bottom">
-              <button
-                onClick={cancelUpload}
-                className="h-8 px-3 flex items-center justify-center gap-1.5 rounded-lg bg-red-500/20 hover:bg-red-500/30 text-red-400 hover:text-red-300 transition-colors cursor-pointer text-xs font-medium"
-              >
-                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                </svg>
-                Cancel
-              </button>
-            </Tooltip>
-          ) : (
-            <Tooltip text="Screenshot" position="bottom">
-              <button
-                onClick={handleScreenshot}
-                className="w-8 h-8 flex items-center justify-center rounded-lg bg-[#292524] hover:bg-[#3f3f46] text-[#a8a29e] hover:text-white transition-colors cursor-pointer"
-              >
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" />
-                </svg>
-              </button>
-            </Tooltip>
-          )}
+          <div className="flex items-center gap-1">
+            {hasActiveUploads ? (
+              <Tooltip text="Cancel upload" position="bottom">
+                <button
+                  onClick={cancelUpload}
+                  className="h-8 px-3 flex items-center justify-center gap-1.5 rounded-lg bg-red-500/20 hover:bg-red-500/30 text-red-400 hover:text-red-300 transition-colors cursor-pointer text-xs font-medium"
+                >
+                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                  Cancel
+                </button>
+              </Tooltip>
+            ) : (
+              <>
+                <Tooltip text="Settings" position="bottom">
+                  <button
+                    onClick={() => setSettingsOpen(true)}
+                    className="w-8 h-8 flex items-center justify-center rounded-lg hover:bg-[#292524] text-[#a8a29e] hover:text-white transition-colors cursor-pointer"
+                  >
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                    </svg>
+                  </button>
+                </Tooltip>
+                <Tooltip text="Screenshot" position="bottom">
+                  <button
+                    onClick={handleScreenshot}
+                    className="w-8 h-8 flex items-center justify-center rounded-lg bg-[#292524] hover:bg-[#3f3f46] text-[#a8a29e] hover:text-white transition-colors cursor-pointer"
+                  >
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" />
+                    </svg>
+                  </button>
+                </Tooltip>
+              </>
+            )}
+          </div>
         </div>
 
         {/* Drop Zone */}
-        <DropZone onFilesSelected={handleFilesSelected} disabled={isUploading} />
+        <DropZone onFilesSelected={handleFilesSelected} disabled={false} />
 
         {/* Uploads & History (unified list) */}
         <History
           items={history}
           uploads={uploads}
           onDelete={handleDeleteFile}
-          onClearUploads={() => { setUploads([]); setIsUploading(false); }}
+          onClearUploads={() => { setUploads([]); }}
           onSetPassword={handleSetPassword}
           onRemovePassword={handleRemovePassword}
           onSetExpiry={handleSetExpiry}
           onSetBurnAfterReading={handleSetBurnAfterReading}
           onRemoveBurnAfterReading={handleRemoveBurnAfterReading}
+        />
+
+        {/* Settings panel (slides over content) */}
+        <Settings
+          isOpen={settingsOpen}
+          onClose={() => setSettingsOpen(false)}
+          appVersion={appVersion}
+          addToast={addToast}
         />
 
         {/* In-app toast notifications */}

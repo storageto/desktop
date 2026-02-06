@@ -10,17 +10,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use storage::{
     clear_history, get_history, load_config, save_config, AppConfig, UploadHistoryItem,
     add_to_history, remove_from_history, CollectionFileItem, check_first_launch,
-    get_visitor_token, get_api_url,
+    get_visitor_token, get_auth_token, get_api_url,
 };
 use tauri::ipc::Channel;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, State};
+use tauri::{AppHandle, Emitter, Listener, Manager, PhysicalPosition, State};
 #[cfg(target_os = "macos")]
 use tauri::ActivationPolicy;
 use upload::{
     create_collection, delete_file, mark_collection_ready, upload_file, UploadProgress, UploadResult,
-    init_batch, confirm_batch, upload_to_r2, get_batch_size,
+    init_batch, confirm_batch, upload_to_r2, upload_multipart_to_r2, get_batch_size,
     BatchFileRequest, BatchConfirmFile,
 };
 use chrono::Utc;
@@ -44,6 +44,26 @@ fn is_cancelled(cancel_flag: &Arc<AtomicBool>) -> bool {
     cancel_flag.load(Ordering::SeqCst)
 }
 
+/// Apply default expiry to an uploaded file/collection (fire and forget)
+async fn apply_default_expiry(url: &str, is_collection: bool, days: u32) {
+    // Extract file ID from URL (e.g., https://storage.to/abc123 or https://storage.to/c/abc123)
+    let file_id = if is_collection {
+        url.rsplit('/').next().unwrap_or("")
+    } else {
+        url.rsplit('/').next().unwrap_or("")
+    };
+
+    if file_id.is_empty() {
+        return;
+    }
+
+    eprintln!("[Expiry] Applying default expiry of {} days to {}", days, file_id);
+    match upload::set_expiry(file_id.to_string(), is_collection, days).await {
+        Ok(()) => eprintln!("[Expiry] Default expiry applied successfully"),
+        Err(e) => eprintln!("[Expiry] Failed to apply default expiry: {}", e),
+    }
+}
+
 #[tauri::command]
 async fn upload_single_file(
     path: String,
@@ -59,7 +79,17 @@ async fn upload_single_file(
         return Err("Upload cancelled".to_string());
     }
 
-    upload_file(path, None, on_progress, None).await
+    // Read default expiry before the await
+    let default_expiry = state.config.lock().unwrap().default_expiry_days;
+
+    let result = upload_file(path, None, on_progress, None).await?;
+
+    // Apply default expiry if configured
+    if let Some(days) = default_expiry {
+        apply_default_expiry(&result.url, false, days).await;
+    }
+
+    Ok(result)
 }
 
 const CONCURRENT_UPLOADS: usize = 6;
@@ -73,6 +103,23 @@ struct FileInfo {
     file_id: String,
 }
 
+/// Work item for batch upload workers - handles both single and multipart uploads
+enum BatchWorkItem {
+    Single {
+        idx: usize,
+        file_info: FileInfo,
+        upload_url: String,
+        r2_key: String,
+    },
+    Multipart {
+        idx: usize,
+        file_info: FileInfo,
+        upload_id: String,
+        initial_urls: std::collections::HashMap<String, String>,
+        r2_key: String,
+    },
+}
+
 #[tauri::command]
 async fn upload_files(
     paths: Vec<String>,
@@ -83,17 +130,37 @@ async fn upload_files(
     state.upload_cancelled.store(false, Ordering::SeqCst);
     let cancel_flag = state.upload_cancelled.clone();
 
+    // Read default expiry before the await
+    let default_expiry = state.config.lock().unwrap().default_expiry_days;
+
     // Single file - upload directly (no batch needed)
     if paths.len() == 1 {
         if is_cancelled(&cancel_flag) {
             return Err("Upload cancelled".to_string());
         }
         let result = upload_file(paths[0].clone(), None, on_progress, None).await?;
+
+        // Apply default expiry if configured
+        if let Some(days) = default_expiry {
+            apply_default_expiry(&result.url, false, days).await;
+        }
+
         return Ok(vec![result]);
     }
 
     // Multiple files - use batch upload
-    upload_files_batch(paths, on_progress, cancel_flag).await
+    let results = upload_files_batch(paths, on_progress, cancel_flag).await?;
+
+    // Apply default expiry to the collection if configured
+    if let Some(days) = default_expiry {
+        if let Some(last) = results.last() {
+            if last.is_collection {
+                apply_default_expiry(&last.url, true, days).await;
+            }
+        }
+    }
+
+    Ok(results)
 }
 
 /// Upload multiple files using batch API endpoints (much more efficient)
@@ -177,23 +244,32 @@ async fn upload_files_batch(
 
         let init_results = init_batch(init_requests).await?;
 
-        // Step 3b: Upload files to R2 in parallel (using presigned URLs)
+        // Step 3b: Upload files to R2 in parallel (using presigned URLs or multipart)
         let on_progress = Arc::new(on_progress.clone());
-        let (tx, rx) = tokio::sync::mpsc::channel::<(usize, FileInfo, String, String)>(batch.len());
+        let (tx, rx) = tokio::sync::mpsc::channel::<BatchWorkItem>(batch.len());
         let rx = Arc::new(tokio::sync::Mutex::new(rx));
 
         // Build work items with init results
         for (idx, file_info) in batch.iter().enumerate() {
             let idx_str = idx.to_string();
             if let Some(init_result) = init_results.get(&idx_str) {
+                let fi = FileInfo {
+                    path: file_info.path.clone(),
+                    filename: file_info.filename.clone(),
+                    size: file_info.size,
+                    content_type: file_info.content_type.clone(),
+                    file_id: file_info.file_id.clone(),
+                };
                 if let (Some(upload_url), Some(r2_key)) = (&init_result.upload_url, &init_result.r2_key) {
-                    let _ = tx.send((idx, FileInfo {
-                        path: file_info.path.clone(),
-                        filename: file_info.filename.clone(),
-                        size: file_info.size,
-                        content_type: file_info.content_type.clone(),
-                        file_id: file_info.file_id.clone(),
-                    }, upload_url.clone(), r2_key.clone())).await;
+                    let _ = tx.send(BatchWorkItem::Single {
+                        idx, file_info: fi, upload_url: upload_url.clone(), r2_key: r2_key.clone(),
+                    }).await;
+                } else if let (Some(upload_id), Some(r2_key)) = (&init_result.upload_id, &init_result.r2_key) {
+                    let _ = tx.send(BatchWorkItem::Multipart {
+                        idx, file_info: fi, upload_id: upload_id.clone(),
+                        initial_urls: init_result.initial_urls.clone().unwrap_or_default(),
+                        r2_key: r2_key.clone(),
+                    }).await;
                 } else {
                     eprintln!("[Batch] Missing URL/key for file {}: {:?}", idx, init_result.error);
                 }
@@ -223,79 +299,102 @@ async fn upload_files_batch(
                         let mut rx = rx.lock().await;
                         rx.recv().await
                     };
-                    match item {
-                        Some((idx, file_info, upload_url, r2_key)) => {
-                            // Check cancellation again before starting upload
-                            if cancel.load(Ordering::SeqCst) {
-                                eprintln!("[Batch] Upload of {} cancelled", file_info.filename);
-                                let _ = progress.send(UploadProgress {
-                                    file_id: file_info.file_id.clone(),
-                                    filename: file_info.filename.clone(),
-                                    bytes_uploaded: 0,
-                                    total_bytes: file_info.size,
-                                    percentage: 0.0,
-                                    status: "cancelled".to_string(),
-                                    collection_id: Some(coll_id.clone()),
-                                    collection_name: Some(coll_name.clone()),
-                                });
-                                break;
-                            }
+                    let item = match item {
+                        Some(item) => item,
+                        None => break,
+                    };
 
-                            let path = Path::new(&file_info.path);
+                    // Extract common fields
+                    let (idx, file_info, r2_key) = match &item {
+                        BatchWorkItem::Single { idx, file_info, r2_key, .. } |
+                        BatchWorkItem::Multipart { idx, file_info, r2_key, .. } => (
+                            *idx,
+                            FileInfo {
+                                path: file_info.path.clone(),
+                                filename: file_info.filename.clone(),
+                                size: file_info.size,
+                                content_type: file_info.content_type.clone(),
+                                file_id: file_info.file_id.clone(),
+                            },
+                            r2_key.clone(),
+                        ),
+                    };
 
-                            // Update status to uploading
+                    // Check cancellation again before starting upload
+                    if cancel.load(Ordering::SeqCst) {
+                        eprintln!("[Batch] Upload of {} cancelled", file_info.filename);
+                        let _ = progress.send(UploadProgress {
+                            file_id: file_info.file_id.clone(),
+                            filename: file_info.filename.clone(),
+                            bytes_uploaded: 0,
+                            total_bytes: file_info.size,
+                            percentage: 0.0,
+                            status: "cancelled".to_string(),
+                            collection_id: Some(coll_id.clone()),
+                            collection_name: Some(coll_name.clone()),
+                        });
+                        break;
+                    }
+
+                    let path = Path::new(&file_info.path);
+
+                    // Update status to uploading
+                    let _ = progress.send(UploadProgress {
+                        file_id: file_info.file_id.clone(),
+                        filename: file_info.filename.clone(),
+                        bytes_uploaded: 0,
+                        total_bytes: file_info.size,
+                        percentage: 0.0,
+                        status: "uploading".to_string(),
+                        collection_id: Some(coll_id.clone()),
+                        collection_name: Some(coll_name.clone()),
+                    });
+
+                    // Upload to R2 (single or multipart)
+                    let upload_result = match item {
+                        BatchWorkItem::Single { upload_url, .. } => {
+                            upload_to_r2(
+                                path, &upload_url,
+                                &file_info.file_id, &file_info.filename, file_info.size,
+                                &progress, Some(coll_id.clone()), Some(coll_name.clone()),
+                            ).await
+                        }
+                        BatchWorkItem::Multipart { upload_id, initial_urls, .. } => {
+                            upload_multipart_to_r2(
+                                path, &upload_id, &r2_key, file_info.size, initial_urls,
+                                &file_info.file_id, &file_info.filename, &progress,
+                                Some(coll_id.clone()), Some(coll_name.clone()),
+                            ).await
+                        }
+                    };
+
+                    match upload_result {
+                        Ok(()) => {
+                            let _ = progress.send(UploadProgress {
+                                file_id: file_info.file_id.clone(),
+                                filename: file_info.filename.clone(),
+                                bytes_uploaded: file_info.size,
+                                total_bytes: file_info.size,
+                                percentage: 100.0,
+                                status: "confirming".to_string(),
+                                collection_id: Some(coll_id.clone()),
+                                collection_name: Some(coll_name.clone()),
+                            });
+                            uploaded.push((idx, file_info.filename, file_info.content_type, r2_key, file_info.size));
+                        }
+                        Err(e) => {
+                            eprintln!("[Batch] Failed to upload {}: {}", file_info.filename, e);
                             let _ = progress.send(UploadProgress {
                                 file_id: file_info.file_id.clone(),
                                 filename: file_info.filename.clone(),
                                 bytes_uploaded: 0,
                                 total_bytes: file_info.size,
                                 percentage: 0.0,
-                                status: "uploading".to_string(),
+                                status: "error".to_string(),
                                 collection_id: Some(coll_id.clone()),
                                 collection_name: Some(coll_name.clone()),
                             });
-
-                            // Upload to R2
-                            match upload_to_r2(
-                                path,
-                                &upload_url,
-                                &file_info.file_id,
-                                &file_info.filename,
-                                file_info.size,
-                                &progress,
-                                Some(coll_id.clone()),
-                                Some(coll_name.clone()),
-                            ).await {
-                                Ok(()) => {
-                                    // Mark this file as uploaded (confirming stage)
-                                    let _ = progress.send(UploadProgress {
-                                        file_id: file_info.file_id.clone(),
-                                        filename: file_info.filename.clone(),
-                                        bytes_uploaded: file_info.size,
-                                        total_bytes: file_info.size,
-                                        percentage: 100.0,
-                                        status: "confirming".to_string(),
-                                        collection_id: Some(coll_id.clone()),
-                                        collection_name: Some(coll_name.clone()),
-                                    });
-                                    uploaded.push((idx, file_info.filename, file_info.content_type, r2_key, file_info.size));
-                                }
-                                Err(e) => {
-                                    eprintln!("[Batch] Failed to upload {}: {}", file_info.filename, e);
-                                    let _ = progress.send(UploadProgress {
-                                        file_id: file_info.file_id.clone(),
-                                        filename: file_info.filename.clone(),
-                                        bytes_uploaded: 0,
-                                        total_bytes: file_info.size,
-                                        percentage: 0.0,
-                                        status: "error".to_string(),
-                                        collection_id: Some(coll_id.clone()),
-                                        collection_name: Some(coll_name.clone()),
-                                    });
-                                }
-                            }
                         }
-                        None => break,
                     }
                 }
                 uploaded
@@ -431,6 +530,9 @@ async fn upload_folder(
     state.upload_cancelled.store(false, Ordering::SeqCst);
     let cancel_flag = state.upload_cancelled.clone();
 
+    // Read default expiry before the await
+    let default_expiry = state.config.lock().unwrap().default_expiry_days;
+
     let path = Path::new(&folder_path);
 
     // Check if it's a regular file first (DMG, ISO, etc. can appear as directories on macOS)
@@ -528,22 +630,33 @@ async fn upload_folder(
 
         let init_results = init_batch(init_requests).await?;
 
-        // Upload to R2 in parallel
+        // Upload to R2 in parallel (single or multipart)
         let on_progress = Arc::new(on_progress.clone());
-        let (tx, rx) = tokio::sync::mpsc::channel::<(usize, FileInfo, String, String)>(batch.len());
+        let (tx, rx) = tokio::sync::mpsc::channel::<BatchWorkItem>(batch.len());
         let rx = Arc::new(tokio::sync::Mutex::new(rx));
 
         for (idx, file_info) in batch.iter().enumerate() {
             let idx_str = idx.to_string();
             if let Some(init_result) = init_results.get(&idx_str) {
+                let fi = FileInfo {
+                    path: file_info.path.clone(),
+                    filename: file_info.filename.clone(),
+                    size: file_info.size,
+                    content_type: file_info.content_type.clone(),
+                    file_id: file_info.file_id.clone(),
+                };
                 if let (Some(upload_url), Some(r2_key)) = (&init_result.upload_url, &init_result.r2_key) {
-                    let _ = tx.send((idx, FileInfo {
-                        path: file_info.path.clone(),
-                        filename: file_info.filename.clone(),
-                        size: file_info.size,
-                        content_type: file_info.content_type.clone(),
-                        file_id: file_info.file_id.clone(),
-                    }, upload_url.clone(), r2_key.clone())).await;
+                    let _ = tx.send(BatchWorkItem::Single {
+                        idx, file_info: fi, upload_url: upload_url.clone(), r2_key: r2_key.clone(),
+                    }).await;
+                } else if let (Some(upload_id), Some(r2_key)) = (&init_result.upload_id, &init_result.r2_key) {
+                    let _ = tx.send(BatchWorkItem::Multipart {
+                        idx, file_info: fi, upload_id: upload_id.clone(),
+                        initial_urls: init_result.initial_urls.clone().unwrap_or_default(),
+                        r2_key: r2_key.clone(),
+                    }).await;
+                } else {
+                    eprintln!("[Batch] Missing URL/key for file {}: {:?}", idx, init_result.error);
                 }
             }
         }
@@ -561,7 +674,6 @@ async fn upload_folder(
             handles.push(tokio::spawn(async move {
                 let mut uploaded: Vec<(usize, String, String, String, u64)> = Vec::new();
                 loop {
-                    // Check cancellation before processing next file
                     if cancel.load(Ordering::SeqCst) {
                         eprintln!("[Batch] Folder worker detected cancellation");
                         break;
@@ -571,77 +683,98 @@ async fn upload_folder(
                         let mut rx = rx.lock().await;
                         rx.recv().await
                     };
-                    match item {
-                        Some((idx, file_info, upload_url, r2_key)) => {
-                            // Check cancellation again before starting upload
-                            if cancel.load(Ordering::SeqCst) {
-                                eprintln!("[Batch] Upload of {} cancelled", file_info.filename);
-                                let _ = progress.send(UploadProgress {
-                                    file_id: file_info.file_id.clone(),
-                                    filename: file_info.filename.clone(),
-                                    bytes_uploaded: 0,
-                                    total_bytes: file_info.size,
-                                    percentage: 0.0,
-                                    status: "cancelled".to_string(),
-                                    collection_id: Some(coll_id.clone()),
-                                    collection_name: Some(coll_name.clone()),
-                                });
-                                break;
-                            }
+                    let item = match item {
+                        Some(item) => item,
+                        None => break,
+                    };
 
-                            let path = Path::new(&file_info.path);
+                    let (idx, file_info, r2_key) = match &item {
+                        BatchWorkItem::Single { idx, file_info, r2_key, .. } |
+                        BatchWorkItem::Multipart { idx, file_info, r2_key, .. } => (
+                            *idx,
+                            FileInfo {
+                                path: file_info.path.clone(),
+                                filename: file_info.filename.clone(),
+                                size: file_info.size,
+                                content_type: file_info.content_type.clone(),
+                                file_id: file_info.file_id.clone(),
+                            },
+                            r2_key.clone(),
+                        ),
+                    };
 
+                    if cancel.load(Ordering::SeqCst) {
+                        eprintln!("[Batch] Upload of {} cancelled", file_info.filename);
+                        let _ = progress.send(UploadProgress {
+                            file_id: file_info.file_id.clone(),
+                            filename: file_info.filename.clone(),
+                            bytes_uploaded: 0,
+                            total_bytes: file_info.size,
+                            percentage: 0.0,
+                            status: "cancelled".to_string(),
+                            collection_id: Some(coll_id.clone()),
+                            collection_name: Some(coll_name.clone()),
+                        });
+                        break;
+                    }
+
+                    let path = Path::new(&file_info.path);
+
+                    let _ = progress.send(UploadProgress {
+                        file_id: file_info.file_id.clone(),
+                        filename: file_info.filename.clone(),
+                        bytes_uploaded: 0,
+                        total_bytes: file_info.size,
+                        percentage: 0.0,
+                        status: "uploading".to_string(),
+                        collection_id: Some(coll_id.clone()),
+                        collection_name: Some(coll_name.clone()),
+                    });
+
+                    let upload_result = match item {
+                        BatchWorkItem::Single { upload_url, .. } => {
+                            upload_to_r2(
+                                path, &upload_url,
+                                &file_info.file_id, &file_info.filename, file_info.size,
+                                &progress, Some(coll_id.clone()), Some(coll_name.clone()),
+                            ).await
+                        }
+                        BatchWorkItem::Multipart { upload_id, initial_urls, .. } => {
+                            upload_multipart_to_r2(
+                                path, &upload_id, &r2_key, file_info.size, initial_urls,
+                                &file_info.file_id, &file_info.filename, &progress,
+                                Some(coll_id.clone()), Some(coll_name.clone()),
+                            ).await
+                        }
+                    };
+
+                    match upload_result {
+                        Ok(()) => {
+                            let _ = progress.send(UploadProgress {
+                                file_id: file_info.file_id.clone(),
+                                filename: file_info.filename.clone(),
+                                bytes_uploaded: file_info.size,
+                                total_bytes: file_info.size,
+                                percentage: 100.0,
+                                status: "confirming".to_string(),
+                                collection_id: Some(coll_id.clone()),
+                                collection_name: Some(coll_name.clone()),
+                            });
+                            uploaded.push((idx, file_info.filename, file_info.content_type, r2_key, file_info.size));
+                        }
+                        Err(e) => {
+                            eprintln!("[Batch] Failed to upload {}: {}", file_info.filename, e);
                             let _ = progress.send(UploadProgress {
                                 file_id: file_info.file_id.clone(),
                                 filename: file_info.filename.clone(),
                                 bytes_uploaded: 0,
                                 total_bytes: file_info.size,
                                 percentage: 0.0,
-                                status: "uploading".to_string(),
+                                status: "error".to_string(),
                                 collection_id: Some(coll_id.clone()),
                                 collection_name: Some(coll_name.clone()),
                             });
-
-                            match upload_to_r2(
-                                path,
-                                &upload_url,
-                                &file_info.file_id,
-                                &file_info.filename,
-                                file_info.size,
-                                &progress,
-                                Some(coll_id.clone()),
-                                Some(coll_name.clone()),
-                            ).await {
-                                Ok(()) => {
-                                    // Mark this file as uploaded (confirming stage)
-                                    let _ = progress.send(UploadProgress {
-                                        file_id: file_info.file_id.clone(),
-                                        filename: file_info.filename.clone(),
-                                        bytes_uploaded: file_info.size,
-                                        total_bytes: file_info.size,
-                                        percentage: 100.0,
-                                        status: "confirming".to_string(),
-                                        collection_id: Some(coll_id.clone()),
-                                        collection_name: Some(coll_name.clone()),
-                                    });
-                                    uploaded.push((idx, file_info.filename, file_info.content_type, r2_key, file_info.size));
-                                }
-                                Err(e) => {
-                                    eprintln!("[Batch] Failed to upload {}: {}", file_info.filename, e);
-                                    let _ = progress.send(UploadProgress {
-                                        file_id: file_info.file_id.clone(),
-                                        filename: file_info.filename.clone(),
-                                        bytes_uploaded: 0,
-                                        total_bytes: file_info.size,
-                                        percentage: 0.0,
-                                        status: "error".to_string(),
-                                        collection_id: Some(coll_id.clone()),
-                                        collection_name: Some(coll_name.clone()),
-                                    });
-                                }
-                            }
                         }
-                        None => break,
                     }
                 }
                 uploaded
@@ -745,13 +878,20 @@ async fn upload_folder(
         }
     }
 
-    Ok(UploadResult {
+    let result = UploadResult {
         url: final_collection.url,
         filename: folder_name,
         size: total_size,
         is_collection: true,
         file_count: Some(success_count),
-    })
+    };
+
+    // Apply default expiry if configured
+    if let Some(days) = default_expiry {
+        apply_default_expiry(&result.url, true, days).await;
+    }
+
+    Ok(result)
 }
 
 fn collect_files(dir: &Path) -> Result<Vec<String>, String> {
@@ -950,10 +1090,144 @@ fn restart_app(app: AppHandle) {
     app.restart();
 }
 
+/// Check if autostart is enabled
+#[tauri::command]
+fn get_autostart_enabled(app: AppHandle) -> bool {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch().is_enabled().unwrap_or(false)
+}
+
+/// Enable or disable autostart
+#[tauri::command]
+fn set_autostart_enabled(app: AppHandle, enabled: bool) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
+    let autolaunch = app.autolaunch();
+    if enabled {
+        autolaunch.enable().map_err(|e| format!("Failed to enable autostart: {}", e))
+    } else {
+        autolaunch.disable().map_err(|e| format!("Failed to disable autostart: {}", e))
+    }
+}
+
+/// Get current screenshot shortcut string
+#[tauri::command]
+fn get_screenshot_shortcut(state: State<AppState>) -> Option<String> {
+    state.config.lock().unwrap().screenshot_shortcut.clone()
+}
+
+/// Update the screenshot shortcut: unregister old, register new, save to config
+#[tauri::command]
+fn update_screenshot_shortcut(
+    app: AppHandle,
+    state: State<AppState>,
+    shortcut: String,
+) -> Result<(), String> {
+    use tauri_plugin_global_shortcut::GlobalShortcutExt;
+
+    // Parse the new shortcut to validate it
+    let new_shortcut = shortcut
+        .parse::<tauri_plugin_global_shortcut::Shortcut>()
+        .map_err(|e| format!("Invalid shortcut: {}", e))?;
+
+    // Unregister all existing shortcuts
+    let _ = app.global_shortcut().unregister_all();
+
+    // Register the new shortcut
+    let app_handle = app.clone();
+    app.global_shortcut()
+        .on_shortcut(new_shortcut, move |_app, _scut, event| {
+            if event.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                let _ = app_handle.emit("screenshot-requested", ());
+            }
+        })
+        .map_err(|e| format!("Failed to register shortcut: {}", e))?;
+
+    // Save to config
+    let mut config = state.config.lock().unwrap();
+    config.screenshot_shortcut = Some(shortcut);
+    save_config(&config).map_err(|e| format!("Failed to save config: {}", e))?;
+
+    Ok(())
+}
+
+/// Get auth status (and user info if logged in)
+#[tauri::command]
+async fn get_auth_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let auth_token = {
+        let config = state.config.lock().unwrap();
+        config.auth_token.clone()
+    };
+
+    let Some(token) = auth_token else {
+        return Ok(serde_json::json!({ "logged_in": false }));
+    };
+
+    // Fetch user info from API
+    let api_url = get_api_url();
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!("{}/api/user", api_url))
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Accept", "application/json")
+        .send()
+        .await;
+
+    match response {
+        Ok(resp) if resp.status().is_success() => {
+            if let Ok(user) = resp.json::<serde_json::Value>().await {
+                return Ok(serde_json::json!({
+                    "logged_in": true,
+                    "email": user.get("email").and_then(|v| v.as_str()),
+                    "name": user.get("name").and_then(|v| v.as_str()),
+                }));
+            }
+        }
+        Ok(resp) if resp.status().as_u16() == 401 => {
+            // Token is invalid/expired — clear it
+            let mut config = state.config.lock().unwrap();
+            config.auth_token = None;
+            let _ = save_config(&config);
+            return Ok(serde_json::json!({ "logged_in": false }));
+        }
+        _ => {}
+    }
+
+    // API unreachable but we have a token — show logged in without details
+    Ok(serde_json::json!({ "logged_in": true }))
+}
+
+/// Logout - revoke token on API then clear locally
+#[tauri::command]
+async fn logout(state: State<'_, AppState>) -> Result<(), String> {
+    // Read token before clearing
+    let auth_token = {
+        let config = state.config.lock().unwrap();
+        config.auth_token.clone()
+    };
+
+    // Revoke token on API (fire and forget)
+    if let Some(token) = &auth_token {
+        let api_url = get_api_url();
+        let client = reqwest::Client::new();
+        let _ = client
+            .post(format!("{}/api/auth/logout", api_url))
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Accept", "application/json")
+            .send()
+            .await;
+    }
+
+    // Clear locally
+    let mut config = state.config.lock().unwrap();
+    config.auth_token = None;
+    save_config(&config)
+}
+
 /// Send analytics event to API
 async fn send_analytics_event(event: &str, context: Option<serde_json::Value>) {
     let api_url = get_api_url();
     let visitor_token = get_visitor_token();
+    let auth_token = get_auth_token();
     let version = env!("CARGO_PKG_VERSION");
 
     let client = reqwest::Client::new();
@@ -969,10 +1243,15 @@ async fn send_analytics_event(event: &str, context: Option<serde_json::Value>) {
 
     let mut request = client
         .post(format!("{}/api/app-analytics", api_url))
+        .header("Accept", "application/json")
         .json(&body);
 
     if let Some(token) = visitor_token {
         request = request.header("X-Visitor-Token", token);
+    }
+
+    if let Some(token) = auth_token {
+        request = request.header("Authorization", format!("Bearer {}", token));
     }
 
     // Fire and forget - we don't care about the result for heartbeats
@@ -1163,7 +1442,9 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_screenshots::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_process::init());
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, None))
+        .plugin(tauri_plugin_deep_link::init());
 
     #[cfg(target_os = "macos")]
     {
@@ -1181,10 +1462,12 @@ pub fn run() {
 
             // Build tray menu
             let show_item = MenuItemBuilder::with_id("show", "Show Window").build(app)?;
+            let settings_item = MenuItemBuilder::with_id("settings", "Settings").build(app)?;
             let quit_item = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
 
             let menu = MenuBuilder::new(app)
                 .item(&show_item)
+                .item(&settings_item)
                 .separator()
                 .item(&quit_item)
                 .build()?;
@@ -1207,6 +1490,14 @@ pub fn run() {
                 .tooltip("StorageTo - Click to upload")
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "show" => toggle_window_simple(app),
+                    "settings" => {
+                        // Show window and emit event to open settings panel
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                        let _ = app.emit("open-settings", ());
+                    }
                     "quit" => {
                         app.exit(0);
                     }
@@ -1244,22 +1535,38 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            // Register global shortcut for screenshot
+            // Register global shortcut for screenshot (use config if set, else platform default)
+            let config_shortcut = {
+                let state: State<AppState> = app.state();
+                let shortcut = state.config.lock().unwrap().screenshot_shortcut.clone();
+                shortcut
+            };
+
             #[cfg(target_os = "macos")]
-            let shortcut_str = "Command+Shift+S";
+            let default_shortcut = "Command+Shift+S";
             #[cfg(target_os = "windows")]
-            let shortcut_str = "Control+Shift+S";
+            let default_shortcut = "Control+Shift+S";
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-            let shortcut_str = "Control+Shift+S";
+            let default_shortcut = "Control+Shift+S";
+
+            let shortcut_str = config_shortcut.as_deref().unwrap_or(default_shortcut);
 
             let app_handle = app.handle().clone();
-            let shortcut = shortcut_str.parse::<tauri_plugin_global_shortcut::Shortcut>().unwrap();
-
-            let _ = app.global_shortcut().on_shortcut(shortcut, move |_app, _scut, event| {
-                if event.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
-                    let _ = app_handle.emit("screenshot-requested", ());
-                }
-            });
+            if let Ok(shortcut) = shortcut_str.parse::<tauri_plugin_global_shortcut::Shortcut>() {
+                let _ = app.global_shortcut().on_shortcut(shortcut, move |_app, _scut, event| {
+                    if event.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                        let _ = app_handle.emit("screenshot-requested", ());
+                    }
+                });
+            } else {
+                eprintln!("[Shortcut] Failed to parse shortcut: {}, falling back to default", shortcut_str);
+                let shortcut = default_shortcut.parse::<tauri_plugin_global_shortcut::Shortcut>().unwrap();
+                let _ = app.global_shortcut().on_shortcut(shortcut, move |_app, _scut, event| {
+                    if event.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                        let _ = app_handle.emit("screenshot-requested", ());
+                    }
+                });
+            }
 
             // Show notification on first launch
             if check_first_launch() {
@@ -1270,6 +1577,44 @@ pub fn run() {
                     .body("Click the menu bar icon to upload files.")
                     .show();
             }
+
+            // Handle deep links (storageto://auth?token=XXX)
+            let deep_link_handle = app.handle().clone();
+            app.listen("deep-link://new-url", move |event: tauri::Event| {
+                let urls_str = event.payload();
+                eprintln!("[DeepLink] Received: {}", urls_str);
+
+                // Parse the payload - it's a JSON array of URL strings
+                if let Ok(urls) = serde_json::from_str::<Vec<String>>(urls_str) {
+                    for url_str in urls {
+                        if let Ok(url) = url::Url::parse(&url_str) {
+                            if url.scheme() == "storageto" && url.host_str() == Some("auth") {
+                                // Extract token from query params
+                                for (key, value) in url.query_pairs() {
+                                    if key == "token" {
+                                        eprintln!("[DeepLink] Auth token received");
+                                        let token = value.to_string();
+
+                                        // Save auth token to config
+                                        let state: State<AppState> = deep_link_handle.state();
+                                        let mut config = state.config.lock().unwrap();
+                                        config.auth_token = Some(token.clone());
+                                        let _ = save_config(&config);
+                                        drop(config);
+
+                                        // Show window and emit event
+                                        if let Some(window) = deep_link_handle.get_webview_window("main") {
+                                            let _ = window.show();
+                                            let _ = window.set_focus();
+                                        }
+                                        let _ = deep_link_handle.emit("auth-token-received", ());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
 
             // Keep tray reference alive
             let _ = tray;
@@ -1303,6 +1648,12 @@ pub fn run() {
             take_screenshot,
             get_visitor_token_command,
             restart_app,
+            get_autostart_enabled,
+            set_autostart_enabled,
+            get_screenshot_shortcut,
+            update_screenshot_shortcut,
+            get_auth_status,
+            logout,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
