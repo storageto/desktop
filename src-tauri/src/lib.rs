@@ -886,9 +886,36 @@ async fn take_screenshot() -> Result<String, String> {
 
     #[cfg(target_os = "windows")]
     {
-        // For Windows, use snippingtool /clip and read from clipboard
-        // For now, fall back to error - we'll implement this later
-        return Err("Region selection not yet supported on Windows. Use the full-screen capture.".to_string());
+        // Launch Windows Snip & Sketch overlay, then poll clipboard for the result
+        let ps_script = format!(
+            r#"
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+[System.Windows.Forms.Clipboard]::Clear()
+Start-Process "ms-screenclip:"
+$elapsed = 0
+while ($elapsed -lt 120) {{
+    Start-Sleep -Milliseconds 500
+    $elapsed += 0.5
+    if ([System.Windows.Forms.Clipboard]::ContainsImage()) {{
+        $img = [System.Windows.Forms.Clipboard]::GetImage()
+        $img.Save("{}", [System.Drawing.Imaging.ImageFormat]::Png)
+        exit 0
+    }}
+}}
+exit 1
+"#,
+            path_str.replace("\\", "\\\\")
+        );
+
+        let output = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps_script])
+            .output()
+            .map_err(|e| format!("Failed to run screenshot tool: {}", e))?;
+
+        if !output.status.success() || !screenshot_path.exists() {
+            return Err("Screenshot cancelled".to_string());
+        }
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -1040,8 +1067,9 @@ fn show_window_at_tray(app: &AppHandle, tray_x: f64, tray_y: f64, tray_width: f6
         // Get scale factor for proper HiDPI handling
         let scale_factor = window.scale_factor().unwrap_or(1.0);
 
-        // Window width in logical pixels
+        // Window dimensions in logical pixels
         let window_width = 380.0;
+        let window_height = 580.0;
 
         // Convert tray position to logical if needed (Tauri sometimes returns physical coords)
         let logical_tray_x = tray_x / scale_factor;
@@ -1049,12 +1077,45 @@ fn show_window_at_tray(app: &AppHandle, tray_x: f64, tray_y: f64, tray_width: f6
         let logical_tray_width = tray_width / scale_factor;
         let logical_tray_height = tray_height / scale_factor;
 
-        // Position window centered below tray icon (in logical pixels)
-        let tray_center_x = logical_tray_x + logical_tray_width / 2.0;
-        let x = tray_center_x - window_width / 2.0;
+        // Get monitor bounds for screen edge detection
+        let (monitor_x, monitor_y, monitor_width, monitor_height) = window.current_monitor()
+            .ok()
+            .flatten()
+            .map(|m| {
+                let pos = m.position();
+                let size = m.size();
+                (
+                    pos.x as f64 / scale_factor,
+                    pos.y as f64 / scale_factor,
+                    size.width as f64 / scale_factor,
+                    size.height as f64 / scale_factor,
+                )
+            })
+            .unwrap_or((0.0, 0.0, 1920.0, 1080.0));
 
-        // Position just below the menu bar
-        let y = logical_tray_y + logical_tray_height;
+        // Center horizontally on tray icon
+        let tray_center_x = logical_tray_x + logical_tray_width / 2.0;
+        let mut x = tray_center_x - window_width / 2.0;
+
+        // Try positioning below tray first, fall back to above if off-screen
+        // This handles macOS (top menu bar) and Windows (bottom taskbar)
+        let y_below = logical_tray_y + logical_tray_height;
+        let y_above = logical_tray_y - window_height;
+        let y = if y_below + window_height > monitor_y + monitor_height {
+            // Would go off bottom of screen, position above tray instead
+            y_above
+        } else {
+            y_below
+        };
+
+        // Clamp X to stay within monitor bounds
+        let monitor_right = monitor_x + monitor_width;
+        if x + window_width > monitor_right {
+            x = monitor_right - window_width;
+        }
+        if x < monitor_x {
+            x = monitor_x;
+        }
 
         // Convert back to physical pixels for set_position
         let physical_x = (x * scale_factor) as i32;
@@ -1125,10 +1186,18 @@ pub fn run() {
                 .build()?;
 
             // Build tray icon
-            // Load tray icon (monochrome for light/dark mode support)
+            // macOS: black icon + template mode (OS auto-inverts for dark mode)
+            // Windows: white icon (taskbar is typically dark)
+            #[cfg(target_os = "macos")]
+            let tray_icon = tauri::include_image!("icons/tray.png");
+            #[cfg(target_os = "windows")]
+            let tray_icon = tauri::include_image!("icons/tray-windows.png");
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            let tray_icon = tauri::include_image!("icons/tray.png");
+
             let tray = TrayIconBuilder::new()
-                .icon(tauri::include_image!("icons/tray.png"))
-                .icon_as_template(true)  // macOS will auto-invert for dark mode
+                .icon(tray_icon)
+                .icon_as_template(cfg!(target_os = "macos"))  // Only use template mode on macOS
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .tooltip("StorageTo - Click to upload")
