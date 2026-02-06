@@ -132,7 +132,7 @@ function getExpiryInfo(expiresAt: string): ExpiryInfo {
     text = `${diffMins}m`;
   } else if (diffHours < 24) {
     text = `${diffHours}h`;
-  } else if (diffDays < 3 && remainingHours > 0) {
+  } else if (remainingHours > 0) {
     text = `${diffDays}d ${remainingHours}h`;
   } else {
     text = `${diffDays}d`;

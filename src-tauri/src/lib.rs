@@ -87,6 +87,9 @@ async fn upload_single_file(
     // Apply default expiry if configured
     if let Some(days) = default_expiry {
         apply_default_expiry(&result.url, false, days).await;
+        // Update local history to reflect the actual expiry
+        let new_expires = Utc::now() + chrono::Duration::days(days as i64);
+        let _ = storage::update_history_item_protection(&result.url, None, None, Some(new_expires));
     }
 
     Ok(result)
@@ -143,6 +146,8 @@ async fn upload_files(
         // Apply default expiry if configured
         if let Some(days) = default_expiry {
             apply_default_expiry(&result.url, false, days).await;
+            let new_expires = Utc::now() + chrono::Duration::days(days as i64);
+            let _ = storage::update_history_item_protection(&result.url, None, None, Some(new_expires));
         }
 
         return Ok(vec![result]);
@@ -156,6 +161,8 @@ async fn upload_files(
         if let Some(last) = results.last() {
             if last.is_collection {
                 apply_default_expiry(&last.url, true, days).await;
+                let new_expires = Utc::now() + chrono::Duration::days(days as i64);
+                let _ = storage::update_history_item_protection(&last.url, None, None, Some(new_expires));
             }
         }
     }
@@ -889,6 +896,8 @@ async fn upload_folder(
     // Apply default expiry if configured
     if let Some(days) = default_expiry {
         apply_default_expiry(&result.url, true, days).await;
+        let new_expires = Utc::now() + chrono::Duration::days(days as i64);
+        let _ = storage::update_history_item_protection(&result.url, None, None, Some(new_expires));
     }
 
     Ok(result)
