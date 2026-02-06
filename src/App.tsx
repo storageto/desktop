@@ -662,17 +662,21 @@ function App() {
     }
   };
 
+  const isWindows = navigator.userAgent.includes("Windows");
+
   return (
     <div className="flex flex-col h-screen">
-      {/* Small notch pointing to tray */}
-      <div className="flex justify-center h-2 relative z-10">
-        <svg width="16" height="8" viewBox="0 0 16 8" className="drop-shadow-sm">
-          <path d="M0 8 L6 2 Q8 0 10 2 L16 8 Z" fill="#1c1917" />
-        </svg>
-      </div>
+      {/* Small notch pointing to tray - top on macOS, bottom on Windows */}
+      {!isWindows && (
+        <div className="flex justify-center h-2 relative z-10">
+          <svg width="16" height="8" viewBox="0 0 16 8" className="drop-shadow-sm">
+            <path d="M0 8 L6 2 Q8 0 10 2 L16 8 Z" fill="#1c1917" />
+          </svg>
+        </div>
+      )}
 
       {/* Main window */}
-      <div className="flex-1 flex flex-col bg-[#0c0a09] rounded-2xl overflow-hidden border border-[#292524] shadow-2xl -mt-px relative">
+      <div className={`flex-1 flex flex-col bg-[#0c0a09] rounded-2xl overflow-hidden border border-[#292524] shadow-2xl relative ${isWindows ? '-mb-px' : '-mt-px'}`}>
         {/* Header */}
         <div
           className="flex items-center justify-between px-3 py-2 bg-[#1c1917] border-b border-[#292524]"
@@ -745,6 +749,15 @@ function App() {
         {/* In-app toast notifications */}
         <ToastContainer toasts={toasts} onDismiss={dismissToast} />
       </div>
+
+      {/* Notch pointing down to taskbar on Windows */}
+      {isWindows && (
+        <div className="flex justify-center h-2 relative z-10">
+          <svg width="16" height="8" viewBox="0 0 16 8" className="drop-shadow-sm">
+            <path d="M0 0 L6 6 Q8 8 10 6 L16 0 Z" fill="#1c1917" />
+          </svg>
+        </div>
+      )}
     </div>
   );
 }
