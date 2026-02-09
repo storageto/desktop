@@ -114,6 +114,8 @@ struct ConfirmUploadRequest {
     content_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     collection_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    crc32: Option<u64>,
 }
 
 // Batch upload structs
@@ -156,6 +158,8 @@ pub struct BatchConfirmFile {
     pub size: u64,
     pub content_type: String,
     pub r2_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crc32: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -356,7 +360,7 @@ pub async fn upload_to_r2(
     on_progress: &Channel<UploadProgress>,
     collection_id: Option<String>,
     collection_name: Option<String>,
-) -> Result<(), String> {
+) -> Result<u32, String> {
     upload_single(get_client(), upload_url, path, size, file_id, filename, on_progress, collection_id, collection_name).await
 }
 
@@ -372,7 +376,7 @@ pub async fn upload_multipart_to_r2(
     on_progress: &Channel<UploadProgress>,
     collection_id: Option<String>,
     collection_name: Option<String>,
-) -> Result<(), String> {
+) -> Result<u32, String> {
     upload_multipart_v2(
         get_client(),
         &get_api_url(),
@@ -409,6 +413,18 @@ fn calculate_checksum(path: &Path) -> Result<String, String> {
     }
 
     Ok(hex::encode(hasher.finalize()))
+}
+
+fn compute_crc32(path: &Path) -> Result<u32, String> {
+    let mut file = File::open(path).map_err(|e| format!("Failed to open file for CRC: {}", e))?;
+    let mut hasher = crc32fast::Hasher::new();
+    let mut buffer = [0u8; 65536];
+    loop {
+        let n = file.read(&mut buffer).map_err(|e| format!("CRC read error: {}", e))?;
+        if n == 0 { break; }
+        hasher.update(&buffer[..n]);
+    }
+    Ok(hasher.finalize())
 }
 
 pub async fn upload_file(
@@ -509,7 +525,7 @@ pub async fn upload_file(
         collection_name: None,
     });
 
-    if upload_type == "multipart" {
+    let file_crc = if upload_type == "multipart" {
         // Multipart upload for large files
         let upload_id = init_data.upload_id.ok_or("No upload_id for multipart upload")?;
         let initial_urls = init_data.initial_urls.unwrap_or_default();
@@ -528,12 +544,12 @@ pub async fn upload_file(
             None,
             None,
         )
-        .await?;
+        .await?
     } else {
         // Single upload
         let upload_url = init_data.upload_url.ok_or("No upload_url in response")?;
-        upload_single(&client, &upload_url, path, size, &file_id, &filename, &on_progress, None, None).await?;
-    }
+        upload_single(&client, &upload_url, path, size, &file_id, &filename, &on_progress, None, None).await?
+    };
 
     // Step 3: Confirm upload
     let _ = on_progress.send(UploadProgress {
@@ -553,6 +569,7 @@ pub async fn upload_file(
         size,
         content_type,
         collection_id: collection_id.clone(),
+        crc32: Some(file_crc as u64),
     };
 
     let confirm_response = client
@@ -635,7 +652,7 @@ async fn upload_single(
     on_progress: &Channel<UploadProgress>,
     collection_id: Option<String>,
     collection_name: Option<String>,
-) -> Result<(), String> {
+) -> Result<u32, String> {
     use futures_util::stream::StreamExt;
     use tokio::io::AsyncReadExt;
 
@@ -717,7 +734,7 @@ async fn upload_single(
         return Err(format!("Upload failed: {}", error_text));
     }
 
-    Ok(())
+    compute_crc32(path)
 }
 
 async fn upload_multipart_v2(
@@ -733,7 +750,7 @@ async fn upload_multipart_v2(
     on_progress: &Channel<UploadProgress>,
     collection_id: Option<String>,
     collection_name: Option<String>,
-) -> Result<(), String> {
+) -> Result<u32, String> {
     use std::sync::atomic::AtomicU64;
     use tokio::io::AsyncReadExt;
 
@@ -858,7 +875,7 @@ async fn upload_multipart_v2(
             continue;
         }
 
-        return Ok(());
+        return compute_crc32(path);
     }
 
     Err(last_error)

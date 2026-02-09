@@ -294,7 +294,7 @@ async fn upload_files_batch(
             let cancel = cancel_flag.clone();
 
             handles.push(tokio::spawn(async move {
-                let mut uploaded: Vec<(usize, String, String, String, u64)> = Vec::new(); // (idx, filename, content_type, r2_key, size)
+                let mut uploaded: Vec<(usize, String, String, String, u64, u32)> = Vec::new(); // (idx, filename, content_type, r2_key, size, crc32)
                 loop {
                     // Check cancellation before processing next file
                     if cancel.load(Ordering::SeqCst) {
@@ -376,7 +376,7 @@ async fn upload_files_batch(
                     };
 
                     match upload_result {
-                        Ok(()) => {
+                        Ok(crc) => {
                             let _ = progress.send(UploadProgress {
                                 file_id: file_info.file_id.clone(),
                                 filename: file_info.filename.clone(),
@@ -387,7 +387,7 @@ async fn upload_files_batch(
                                 collection_id: Some(coll_id.clone()),
                                 collection_name: Some(coll_name.clone()),
                             });
-                            uploaded.push((idx, file_info.filename, file_info.content_type, r2_key, file_info.size));
+                            uploaded.push((idx, file_info.filename, file_info.content_type, r2_key, file_info.size, crc));
                         }
                         Err(e) => {
                             eprintln!("[Batch] Failed to upload {}: {}", file_info.filename, e);
@@ -415,12 +415,13 @@ async fn upload_files_batch(
         for handle in handles {
             match handle.await {
                 Ok(results) => {
-                    for (_, filename, content_type, r2_key, size) in results {
+                    for (_, filename, content_type, r2_key, size, crc) in results {
                         uploaded_files.push(BatchConfirmFile {
                             filename: filename.clone(),
                             size,
                             content_type,
                             r2_key,
+                            crc32: Some(crc as u64),
                         });
                         batch_uploaded.push((filename, size));
                     }
@@ -679,7 +680,7 @@ async fn upload_folder(
             let cancel = cancel_flag.clone();
 
             handles.push(tokio::spawn(async move {
-                let mut uploaded: Vec<(usize, String, String, String, u64)> = Vec::new();
+                let mut uploaded: Vec<(usize, String, String, String, u64, u32)> = Vec::new();
                 loop {
                     if cancel.load(Ordering::SeqCst) {
                         eprintln!("[Batch] Folder worker detected cancellation");
@@ -756,7 +757,7 @@ async fn upload_folder(
                     };
 
                     match upload_result {
-                        Ok(()) => {
+                        Ok(crc) => {
                             let _ = progress.send(UploadProgress {
                                 file_id: file_info.file_id.clone(),
                                 filename: file_info.filename.clone(),
@@ -767,7 +768,7 @@ async fn upload_folder(
                                 collection_id: Some(coll_id.clone()),
                                 collection_name: Some(coll_name.clone()),
                             });
-                            uploaded.push((idx, file_info.filename, file_info.content_type, r2_key, file_info.size));
+                            uploaded.push((idx, file_info.filename, file_info.content_type, r2_key, file_info.size, crc));
                         }
                         Err(e) => {
                             eprintln!("[Batch] Failed to upload {}: {}", file_info.filename, e);
@@ -795,12 +796,13 @@ async fn upload_folder(
         for handle in handles {
             match handle.await {
                 Ok(results) => {
-                    for (_, filename, content_type, r2_key, size) in results {
+                    for (_, filename, content_type, r2_key, size, crc) in results {
                         uploaded_files.push(BatchConfirmFile {
                             filename: filename.clone(),
                             size,
                             content_type,
                             r2_key,
+                            crc32: Some(crc as u64),
                         });
                         batch_uploaded.push((filename, size));
                     }
