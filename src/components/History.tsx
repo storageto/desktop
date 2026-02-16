@@ -691,11 +691,9 @@ export function History({ items, uploads, onDelete, onClearUploads, onSetPasswor
   // Group ALL uploads by collection (including completed ones for accurate counts)
   const { collectionGroups, standaloneUploads } = groupUploadsByCollection(uploads);
 
-  // Filter to only show groups/uploads that have active (non-complete) items
-  const activeCollectionGroups = collectionGroups.filter(g =>
-    g.files.some(f => f.status !== "complete")
-  );
-  const activeStandaloneUploads = standaloneUploads.filter(u => u.status !== "complete");
+  // Show all uploads including complete (they stay visible until cleared after history loads)
+  const activeCollectionGroups = collectionGroups;
+  const activeStandaloneUploads = standaloneUploads;
 
   // Filter items by search query
   const filteredItems = searchQuery.trim()
@@ -818,6 +816,10 @@ export function History({ items, uploads, onDelete, onClearUploads, onSetPasswor
                   {upload.status === "error" ? (
                     <svg className="w-4 h-4 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                  ) : upload.status === "complete" ? (
+                    <svg className="w-4 h-4 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
                     </svg>
                   ) : upload.status === "queued" ? (
                     <svg className="w-4 h-4 text-[#57534e]" fill="none" stroke="currentColor" viewBox="0 0 24 24">

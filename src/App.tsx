@@ -255,9 +255,9 @@ function App() {
             isCollection: true,
           });
 
-          // Clear uploads and refresh history
-          setUploads([]);
+          // Refresh history first, then clear uploads so file doesn't vanish
           await loadHistory();
+          setUploads([]);
           return;
         } catch {
           // Not a folder, continue with file upload
@@ -295,9 +295,9 @@ function App() {
           isCollection: results.length > 1 || lastResult.is_collection,
         });
 
-        // Clear uploads and refresh history
-        setUploads([]);
+        // Refresh history first, then clear uploads so file doesn't vanish
         await loadHistory();
+        setUploads([]);
       }
     } catch (err) {
       console.error("Upload failed:", err);
@@ -358,9 +358,9 @@ function App() {
       // Track analytics
       trackScreenshotComplete();
 
-      // Clear uploads and refresh history
-      setUploads([]);
+      // Refresh history first, then clear uploads so file doesn't vanish
       await loadHistory();
+      setUploads([]);
     } catch (err) {
       console.error("[Screenshot] Error:", err);
       const rawError = String(err);
