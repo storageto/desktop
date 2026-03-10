@@ -157,6 +157,7 @@ pub fn get_visitor_token() -> Option<String> {
     Some(token)
 }
 
+#[allow(dead_code)]
 pub fn set_visitor_token(token: String) -> Result<(), String> {
     let mut config = load_config();
     config.visitor_token = Some(token);
@@ -171,6 +172,7 @@ pub fn get_api_url() -> String {
     load_config().api_url
 }
 
+#[allow(dead_code)]
 pub fn set_api_url(url: String) -> Result<(), String> {
     let mut config = load_config();
     config.api_url = url;

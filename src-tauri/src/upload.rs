@@ -3,7 +3,6 @@ use chrono::Utc;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_LENGTH, CONTENT_TYPE};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -56,10 +55,13 @@ struct InitUploadResponse {
     upload_url: Option<String>,
     r2_key: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     headers: Option<std::collections::HashMap<String, Vec<String>>>,
     // Multipart fields
     upload_id: Option<String>,
+    #[allow(dead_code)]
     part_size: Option<i64>,
+    #[allow(dead_code)]
     total_parts: Option<i32>,
     initial_urls: Option<std::collections::HashMap<String, String>>,
     // Error fields
@@ -76,9 +78,12 @@ struct ConfirmResponse {
 
 #[derive(Debug, Deserialize)]
 struct FileResponse {
+    #[allow(dead_code)]
     id: String,
     url: String,
+    #[allow(dead_code)]
     filename: String,
+    #[allow(dead_code)]
     size: u64,
     expires_at: Option<String>,
 }
@@ -143,11 +148,13 @@ pub struct InitBatchResult {
     pub upload_url: Option<String>,
     pub r2_key: Option<String>,
     #[serde(rename = "type")]
+    #[allow(dead_code)]
     pub upload_type: Option<String>,
     // Multipart fields (for large files)
     pub upload_id: Option<String>,
     pub initial_urls: Option<std::collections::HashMap<String, String>>,
     // Error handling
+    #[allow(dead_code)]
     pub success: Option<bool>,
     pub error: Option<String>,
 }
@@ -179,6 +186,7 @@ struct ConfirmBatchResponse {
 pub struct ConfirmBatchResult {
     pub success: bool,
     pub file: Option<BatchConfirmedFile>,
+    #[allow(dead_code)]
     pub error: Option<String>,
 }
 
@@ -397,22 +405,6 @@ pub async fn upload_multipart_to_r2(
 /// Get the BATCH_SIZE constant for external use
 pub fn get_batch_size() -> usize {
     BATCH_SIZE
-}
-
-fn calculate_checksum(path: &Path) -> Result<String, String> {
-    let mut file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 8192];
-
-    loop {
-        let bytes_read = file.read(&mut buffer).map_err(|e| format!("Failed to read file: {}", e))?;
-        if bytes_read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..bytes_read]);
-    }
-
-    Ok(hex::encode(hasher.finalize()))
 }
 
 fn compute_crc32(path: &Path) -> Result<u32, String> {
@@ -654,7 +646,6 @@ async fn upload_single(
     collection_id: Option<String>,
     collection_name: Option<String>,
 ) -> Result<u32, String> {
-    use futures_util::stream::StreamExt;
     use tokio::io::AsyncReadExt;
 
     let content_type = get_content_type(path);
