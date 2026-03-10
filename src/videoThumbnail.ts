@@ -353,16 +353,16 @@ async function uploadThumbnail(fileId: string, blob: Blob): Promise<void> {
 }
 
 /**
- * Process uploaded files and extract/upload thumbnails for videos and images.
- * Fire-and-forget — errors are logged but never thrown.
- *
- * @param paths - Local file paths that were uploaded
- * @param urls - Corresponding storage.to URLs from upload results
+ * Generate thumbnail icons and save to history (fast, all local).
+ * Call this BEFORE loadHistory() so icons are ready when the UI renders.
+ * Returns the extracted blobs for subsequent API upload.
  */
-export async function processThumbnails(
+export async function generateThumbnailIcons(
   paths: string[],
   urls: string[]
-): Promise<void> {
+): Promise<Map<string, Blob>> {
+  const blobs = new Map<string, Blob>();
+
   for (let i = 0; i < paths.length; i++) {
     const path = paths[i];
     const url = urls[i];
@@ -372,9 +372,6 @@ export async function processThumbnails(
     const isVideo = isVideoFile(path);
     const isImage = isImageFile(path);
     if (!isVideo && !isImage) continue;
-
-    const fileId = extractFileId(url);
-    if (!fileId) continue;
 
     try {
       console.log("[Thumbnail] Extracting thumbnail for:", path);
@@ -387,9 +384,8 @@ export async function processThumbnails(
         continue;
       }
 
-      console.log("[Thumbnail] Uploading thumbnail for file:", fileId);
-      await uploadThumbnail(fileId, blob);
-      console.log("[Thumbnail] Thumbnail uploaded for file:", fileId);
+      const fileId = extractFileId(url);
+      if (fileId) blobs.set(fileId, blob);
 
       const iconBlob = await createIconBlob(blob);
       if (iconBlob) {
@@ -397,10 +393,31 @@ export async function processThumbnails(
         await invoke("set_history_thumbnail", { url, thumbnailUrl: dataUrl }).catch(() => {});
       }
     } catch (e) {
-      console.warn("[Thumbnail] Failed for", path, e);
+      console.warn("[Thumbnail] Icon generation failed for", path, e);
+    }
+  }
+
+  return blobs;
+}
+
+/**
+ * Upload thumbnail blobs to the API (slow, network).
+ * Fire-and-forget — errors are logged but never thrown.
+ */
+export async function uploadThumbnails(blobs: Map<string, Blob>): Promise<void> {
+  for (const [fileId, blob] of blobs) {
+    try {
+      console.log("[Thumbnail] Uploading thumbnail for file:", fileId);
+      await uploadThumbnail(fileId, blob);
+      console.log("[Thumbnail] Thumbnail uploaded for file:", fileId);
+    } catch (e) {
+      console.warn("[Thumbnail] Upload failed for", fileId, e);
     }
   }
 }
 
-/** @deprecated Use processThumbnails instead */
-export const processVideoThumbnails = processThumbnails;
+/** @deprecated Use generateThumbnailIcons + uploadThumbnails instead */
+export async function processVideoThumbnails(paths: string[], urls: string[]): Promise<void> {
+  const blobs = await generateThumbnailIcons(paths, urls);
+  await uploadThumbnails(blobs);
+}
