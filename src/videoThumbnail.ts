@@ -1,5 +1,4 @@
 import { invoke } from "@tauri-apps/api/core";
-import { readFile } from "@tauri-apps/plugin-fs";
 
 const VIDEO_EXTENSIONS = [".mp4", ".webm", ".mov"];
 const IMAGE_EXTENSIONS = [".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff", ".tif"];
@@ -67,10 +66,11 @@ function getVideoMimeType(path: string): string {
  * then uses <video> + <canvas> to extract a frame.
  */
 async function extractVideoThumbnail(filePath: string): Promise<Blob | null> {
-  // Read the file using Tauri's fs plugin
+  // Read the file using Rust command (bypasses fs plugin scope restrictions)
   let fileBytes: Uint8Array;
   try {
-    fileBytes = await readFile(filePath);
+    const bytes = await invoke<number[]>("read_file_bytes", { path: filePath });
+    fileBytes = new Uint8Array(bytes);
   } catch (e) {
     console.warn("[Thumbnail] Failed to read file:", e);
     return null;
@@ -223,7 +223,8 @@ function getImageMimeType(path: string): string {
 async function extractImageThumbnail(filePath: string): Promise<Blob | null> {
   let fileBytes: Uint8Array;
   try {
-    fileBytes = await readFile(filePath);
+    const bytes = await invoke<number[]>("read_file_bytes", { path: filePath });
+    fileBytes = new Uint8Array(bytes);
   } catch (e) {
     console.warn("[Thumbnail] Failed to read image:", e);
     return null;

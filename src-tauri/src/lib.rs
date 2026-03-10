@@ -1241,6 +1241,11 @@ async fn logout(state: State<'_, AppState>) -> Result<(), String> {
     save_config(&config)
 }
 
+#[tauri::command]
+async fn read_file_bytes(path: String) -> Result<Vec<u8>, String> {
+    tokio::fs::read(&path).await.map_err(|e| format!("Failed to read {}: {}", path, e))
+}
+
 /// Send analytics event to API
 async fn send_analytics_event(event: &str, context: Option<serde_json::Value>) {
     let api_url = get_api_url();
@@ -1674,6 +1679,7 @@ pub fn run() {
             update_screenshot_shortcut,
             get_auth_status,
             logout,
+            read_file_bytes,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
