@@ -70,6 +70,7 @@
       }
     },
     "windows": {
+      "signCommand": "trusted-signing-cli -e https://weu.codesigning.azure.net/ -a tauri-signing -c storageto-desktop %1",
       "webviewInstallMode": {
         "type": "downloadBootstrapper"
       }

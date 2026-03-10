@@ -74,7 +74,6 @@ jobs:
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
-          TAURI_CONF: ${{ matrix.platform == 'windows-latest' && '{"bundle":{"windows":{"signCommand":"trusted-signing-cli -e https://weu.codesigning.azure.net/ -a tauri-signing -c storageto-desktop %1"}}}' || '{}' }}
         with:
           tagName: v__VERSION__
           releaseName: 'Storage.to Desktop v__VERSION__'
