@@ -516,16 +516,16 @@ async fn upload_files_batch(
         }
     }
 
-    // Return collection result
-    let collection_result = UploadResult {
+    // Return individual file results + collection result (last entry)
+    all_results.push(UploadResult {
         url: final_collection.url,
         filename: collection_name,
         size: total_size,
         is_collection: true,
         file_count: Some(file_count),
-    };
+    });
 
-    Ok(vec![collection_result])
+    Ok(all_results)
 }
 
 #[tauri::command]

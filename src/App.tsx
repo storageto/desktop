@@ -12,6 +12,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getVersion } from "@tauri-apps/api/app";
 import { reportError } from "./errorReporter";
 import { trackUploadComplete, trackScreenshotComplete } from "./analyticsReporter";
+import { processVideoThumbnails } from "./videoThumbnail";
 
 interface UploadProgress {
   file_id: string;
@@ -274,26 +275,34 @@ function App() {
       });
 
       if (results.length > 0) {
-        // Copy the first (or only) URL to clipboard
+        // Separate individual file results from the collection result
+        const fileResults = results.filter(r => !r.is_collection);
         const lastResult = results[results.length - 1];
         await copyToClipboard(lastResult.url);
 
-        if (results.length === 1) {
+        if (fileResults.length <= 1 && !lastResult.is_collection) {
           await showNotification("Upload complete", `${lastResult.filename} - URL copied!`);
         } else {
+          const count = lastResult.file_count || fileResults.length;
           await showNotification(
             "Uploads complete",
-            `${results.length} files uploaded - Last URL copied!`
+            `${count} files uploaded - URL copied!`
           );
         }
 
-        // Track analytics
-        const totalSize = results.reduce((sum, r) => sum + r.size, 0);
+        // Track analytics (use file results to avoid double-counting collection)
+        const totalSize = fileResults.reduce((sum, r) => sum + r.size, 0) || lastResult.size;
         trackUploadComplete({
-          fileCount: results.length,
+          fileCount: fileResults.length || 1,
           totalSize,
-          isCollection: results.length > 1 || lastResult.is_collection,
+          isCollection: lastResult.is_collection,
         });
+
+        // Extract and upload video thumbnails (fire-and-forget)
+        const fileUrls = fileResults.map(r => r.url);
+        if (fileUrls.length > 0) {
+          processVideoThumbnails(paths, fileUrls).catch(() => {});
+        }
 
         // Refresh history first, then clear uploads so file doesn't vanish
         await loadHistory();
