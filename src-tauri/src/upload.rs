@@ -618,6 +618,7 @@ pub async fn upload_file(
             password_protected: None,
             burn_after_reading: None,
             expires_at,
+            thumbnail_url: None,
         };
         let _ = add_to_history(history_item);
     }

@@ -2,6 +2,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { readFile } from "@tauri-apps/plugin-fs";
 
 const VIDEO_EXTENSIONS = [".mp4", ".webm", ".mov"];
+const IMAGE_EXTENSIONS = [".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff", ".tif"];
+const MIN_IMAGE_SIZE_FOR_THUMBNAIL = 256 * 1024; // 256KB
 const THUMBNAIL_TIMEOUT_MS = 8000;
 const THUMBNAIL_MAX_WIDTH = 1280;
 const THUMBNAIL_JPEG_QUALITY = 0.85;
@@ -193,7 +195,146 @@ function captureFrame(videoUrl: string): Promise<Blob | null> {
 }
 
 /**
- * Upload a thumbnail blob to the API
+ * Check if a file path is a supported image format
+ */
+function isImageFile(path: string): boolean {
+  const lower = path.toLowerCase();
+  return IMAGE_EXTENSIONS.some((ext) => lower.endsWith(ext));
+}
+
+/**
+ * Get the MIME type for an image file based on extension
+ */
+function getImageMimeType(path: string): string {
+  const lower = path.toLowerCase();
+  if (lower.endsWith(".png")) return "image/png";
+  if (lower.endsWith(".webp")) return "image/webp";
+  if (lower.endsWith(".gif")) return "image/gif";
+  if (lower.endsWith(".bmp")) return "image/bmp";
+  if (lower.endsWith(".tiff") || lower.endsWith(".tif")) return "image/tiff";
+  return "image/jpeg";
+}
+
+/**
+ * Extract a thumbnail from a local image file.
+ * Reads the file, loads into <img>, scales down via canvas.
+ * Skips files < 256KB or images already <= 1280px wide.
+ */
+async function extractImageThumbnail(filePath: string): Promise<Blob | null> {
+  let fileBytes: Uint8Array;
+  try {
+    fileBytes = await readFile(filePath);
+  } catch (e) {
+    console.warn("[Thumbnail] Failed to read image:", e);
+    return null;
+  }
+
+  if (fileBytes.byteLength < MIN_IMAGE_SIZE_FOR_THUMBNAIL) {
+    console.log("[Thumbnail] Image too small, skipping:", filePath);
+    return null;
+  }
+
+  const mimeType = getImageMimeType(filePath);
+  const imageBlob = new Blob([fileBytes], { type: mimeType });
+  const blobUrl = URL.createObjectURL(imageBlob);
+
+  try {
+    return await resizeImage(blobUrl);
+  } finally {
+    URL.revokeObjectURL(blobUrl);
+  }
+}
+
+/**
+ * Load an image, scale it down to max width, and return as JPEG blob.
+ * Returns null if image is already <= max width.
+ */
+function resizeImage(imageUrl: string): Promise<Blob | null> {
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      console.warn("[Thumbnail] Image resize timed out");
+      resolve(null);
+    }, THUMBNAIL_TIMEOUT_MS);
+
+    const img = new Image();
+
+    img.addEventListener("error", () => {
+      clearTimeout(timeout);
+      console.warn("[Thumbnail] Image load error");
+      resolve(null);
+    });
+
+    img.addEventListener("load", () => {
+      try {
+        if (img.naturalWidth <= THUMBNAIL_MAX_WIDTH) {
+          clearTimeout(timeout);
+          console.log("[Thumbnail] Image already small enough, skipping");
+          resolve(null);
+          return;
+        }
+
+        const canvas = document.createElement("canvas");
+        const ratio = THUMBNAIL_MAX_WIDTH / img.naturalWidth;
+        canvas.width = THUMBNAIL_MAX_WIDTH;
+        canvas.height = Math.round(img.naturalHeight * ratio);
+        canvas.getContext("2d")!.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+        canvas.toBlob(
+          (blob) => {
+            clearTimeout(timeout);
+            resolve(blob);
+          },
+          "image/jpeg",
+          THUMBNAIL_JPEG_QUALITY
+        );
+      } catch (e) {
+        clearTimeout(timeout);
+        console.warn("[Thumbnail] Image canvas error:", e);
+        resolve(null);
+      }
+    });
+
+    img.src = imageUrl;
+  });
+}
+
+/**
+ * Convert a blob to a data URL for local storage/display.
+ */
+function blobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => resolve(reader.result as string);
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+
+/**
+ * Create a tiny icon-sized blob (64px) from a thumbnail blob for local history display.
+ */
+function createIconBlob(blob: Blob): Promise<Blob | null> {
+  return new Promise((resolve) => {
+    const img = new Image();
+    const blobUrl = URL.createObjectURL(blob);
+    img.addEventListener("error", () => { URL.revokeObjectURL(blobUrl); resolve(null); });
+    img.addEventListener("load", () => {
+      try {
+        const canvas = document.createElement("canvas");
+        const size = 64;
+        const scale = Math.min(size / img.naturalWidth, size / img.naturalHeight);
+        canvas.width = Math.round(img.naturalWidth * scale);
+        canvas.height = Math.round(img.naturalHeight * scale);
+        canvas.getContext("2d")!.drawImage(img, 0, 0, canvas.width, canvas.height);
+        canvas.toBlob((b) => { URL.revokeObjectURL(blobUrl); resolve(b); }, "image/jpeg", 0.7);
+      } catch { URL.revokeObjectURL(blobUrl); resolve(null); }
+    });
+    img.src = blobUrl;
+  });
+}
+
+/**
+ * Upload a thumbnail blob to the API.
  */
 async function uploadThumbnail(fileId: string, blob: Blob): Promise<void> {
   const headers = await getAuthHeaders();
@@ -212,13 +353,13 @@ async function uploadThumbnail(fileId: string, blob: Blob): Promise<void> {
 }
 
 /**
- * Process uploaded files and extract/upload thumbnails for any videos.
+ * Process uploaded files and extract/upload thumbnails for videos and images.
  * Fire-and-forget — errors are logged but never thrown.
  *
  * @param paths - Local file paths that were uploaded
  * @param urls - Corresponding storage.to URLs from upload results
  */
-export async function processVideoThumbnails(
+export async function processThumbnails(
   paths: string[],
   urls: string[]
 ): Promise<void> {
@@ -226,14 +367,21 @@ export async function processVideoThumbnails(
     const path = paths[i];
     const url = urls[i];
 
-    if (!path || !url || !isVideoFile(path)) continue;
+    if (!path || !url) continue;
+
+    const isVideo = isVideoFile(path);
+    const isImage = isImageFile(path);
+    if (!isVideo && !isImage) continue;
 
     const fileId = extractFileId(url);
     if (!fileId) continue;
 
     try {
       console.log("[Thumbnail] Extracting thumbnail for:", path);
-      const blob = await extractVideoThumbnail(path);
+      const blob = isVideo
+        ? await extractVideoThumbnail(path)
+        : await extractImageThumbnail(path);
+
       if (!blob) {
         console.log("[Thumbnail] No thumbnail extracted for:", path);
         continue;
@@ -242,8 +390,17 @@ export async function processVideoThumbnails(
       console.log("[Thumbnail] Uploading thumbnail for file:", fileId);
       await uploadThumbnail(fileId, blob);
       console.log("[Thumbnail] Thumbnail uploaded for file:", fileId);
+
+      const iconBlob = await createIconBlob(blob);
+      if (iconBlob) {
+        const dataUrl = await blobToDataUrl(iconBlob);
+        await invoke("set_history_thumbnail", { url, thumbnailUrl: dataUrl }).catch(() => {});
+      }
     } catch (e) {
       console.warn("[Thumbnail] Failed for", path, e);
     }
   }
 }
+
+/** @deprecated Use processThumbnails instead */
+export const processVideoThumbnails = processThumbnails;

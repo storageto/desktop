@@ -12,7 +12,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getVersion } from "@tauri-apps/api/app";
 import { reportError } from "./errorReporter";
 import { trackUploadComplete, trackScreenshotComplete } from "./analyticsReporter";
-import { processVideoThumbnails } from "./videoThumbnail";
+import { processThumbnails } from "./videoThumbnail";
 
 interface UploadProgress {
   file_id: string;
@@ -298,10 +298,10 @@ function App() {
           isCollection: lastResult.is_collection,
         });
 
-        // Extract and upload video thumbnails (fire-and-forget)
+        // Extract and upload thumbnails for videos and images (fire-and-forget, reload history when done)
         const fileUrls = fileResults.map(r => r.url);
         if (fileUrls.length > 0) {
-          processVideoThumbnails(paths, fileUrls).catch(() => {});
+          processThumbnails(paths, fileUrls).then(() => loadHistory()).catch(() => {});
         }
 
         // Refresh history first, then clear uploads so file doesn't vanish

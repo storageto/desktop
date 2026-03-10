@@ -496,6 +496,7 @@ async fn upload_files_batch(
         password_protected: None,
         burn_after_reading: None,
         expires_at,
+        thumbnail_url: None,
     };
     let _ = add_to_history(history_item);
 
@@ -868,6 +869,7 @@ async fn upload_folder(
         password_protected: None,
         burn_after_reading: None,
         expires_at,
+        thumbnail_url: None,
     };
     let _ = add_to_history(history_item);
 
@@ -943,6 +945,11 @@ fn get_upload_history() -> Vec<UploadHistoryItem> {
 #[tauri::command]
 fn clear_upload_history() -> Result<(), String> {
     clear_history()
+}
+
+#[tauri::command]
+fn set_history_thumbnail(url: String, thumbnail_url: String) -> Result<(), String> {
+    storage::update_history_item_thumbnail(&url, &thumbnail_url)
 }
 
 #[tauri::command]
@@ -1647,6 +1654,7 @@ pub fn run() {
             cancel_upload,
             get_upload_history,
             clear_upload_history,
+            set_history_thumbnail,
             delete_uploaded_file,
             set_file_password,
             set_file_expiry,

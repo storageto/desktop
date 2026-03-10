@@ -23,6 +23,7 @@ export interface HistoryItem {
   password_protected?: boolean;
   burn_after_reading?: boolean;
   expires_at?: string;
+  thumbnail_url?: string;
 }
 
 export interface UploadItem {
@@ -898,6 +899,12 @@ export function History({ items, uploads, onDelete, onClearUploads, onSetPasswor
                         <path fillRule="evenodd" d="M7.293 14.707a1 1 0 010-1.414L10.586 10 7.293 6.707a1 1 0 011.414-1.414l4 4a1 1 0 010 1.414l-4 4a1 1 0 01-1.414 0z" clipRule="evenodd" />
                       </svg>
                     </button>
+                  ) : item.thumbnail_url ? (
+                    <img
+                      src={item.thumbnail_url}
+                      alt=""
+                      className="w-8 h-8 rounded-lg object-cover flex-shrink-0"
+                    />
                   ) : (
                     <div className="w-8 h-8 rounded-lg bg-[#1c1917] group-hover:bg-[#292524] flex items-center justify-center flex-shrink-0 transition-colors">
                       {getFileIcon(item.filename, item.is_collection)}

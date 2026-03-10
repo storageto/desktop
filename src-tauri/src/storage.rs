@@ -31,6 +31,8 @@ pub struct UploadHistoryItem {
     pub burn_after_reading: Option<bool>,
     #[serde(default)]
     pub expires_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub thumbnail_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -185,6 +187,19 @@ pub fn check_first_launch() -> bool {
         return true;
     }
     false
+}
+
+pub fn update_history_item_thumbnail(url: &str, thumbnail_url: &str) -> Result<(), String> {
+    let mut config = load_config();
+
+    for item in &mut config.upload_history {
+        if item.url == url {
+            item.thumbnail_url = Some(thumbnail_url.to_string());
+            break;
+        }
+    }
+
+    save_config(&config)
 }
 
 pub fn update_history_item_protection(
