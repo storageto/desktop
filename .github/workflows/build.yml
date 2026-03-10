@@ -53,26 +53,6 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: Debug signing setup
-        if: matrix.platform == 'windows-latest'
-        env:
-          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
-        run: |
-          echo "=== Check signtool.exe ==="
-          dir "C:\Program Files (x86)\Windows Kits\10\bin\10.0*" 2>nul || echo "No Windows Kits found"
-          where signtool.exe 2>nul || echo "signtool.exe not in PATH"
-          echo "=== Check Azure CLI ==="
-          where az 2>nul || echo "az not in PATH"
-          echo "=== Check trusted-signing-cli ==="
-          where trusted-signing-cli 2>nul || echo "trusted-signing-cli not in PATH"
-          trusted-signing-cli --version 2>nul || echo "trusted-signing-cli version check failed"
-          echo "=== Test sign with dummy file ==="
-          echo test > test.txt
-          trusted-signing-cli -e https://weu.codesigning.azure.net/ -a tauri-signing -c storageto-desktop test.txt 2>&1 || echo "Sign test failed (expected for non-exe)"
-        shell: cmd
-
       - name: Install dependencies
         run: npm ci
 
