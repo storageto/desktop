@@ -42,6 +42,17 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # Windows code signing prerequisites
+      - name: Install trusted-signing-cli
+        if: matrix.platform == 'windows-latest'
+        run: cargo install trusted-signing-cli
+
+      - name: Install .NET 8 SDK
+        if: matrix.platform == 'windows-latest'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
       - name: Install dependencies
         run: npm ci
 
@@ -49,7 +60,7 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # macOS code signing (set these secrets in repo settings)
+          # macOS code signing
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -59,6 +70,11 @@ jobs:
           # Tauri updater signing key
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Windows code signing (Azure Trusted Signing)
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          TAURI_CONF: ${{ matrix.platform == 'windows-latest' && '{"bundle":{"windows":{"signCommand":"trusted-signing-cli -e https://weu.codesigning.azure.net/ -a tauri-signing -c storageto-desktop %1"}}}' || '{}' }}
         with:
           tagName: v__VERSION__
           releaseName: 'Storage.to Desktop v__VERSION__'
