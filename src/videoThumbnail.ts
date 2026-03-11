@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { reportError } from "./errorReporter";
 
 const VIDEO_EXTENSIONS = [".mp4", ".webm", ".mov"];
 const IMAGE_EXTENSIONS = [".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff", ".tif"];
@@ -72,13 +73,12 @@ async function extractVideoThumbnail(filePath: string): Promise<Blob | null> {
     const bytes = await invoke<number[]>("read_file_bytes", { path: filePath });
     fileBytes = new Uint8Array(bytes);
   } catch (e) {
-    console.warn("[Thumbnail] Failed to read file:", e);
+    reportError({ type: "thumbnail", message: `Video read failed: ${e}`, context: { path: filePath, step: "read_file_bytes" } });
     return null;
   }
 
   // Skip very large files to avoid memory pressure
   if (fileBytes.byteLength > MAX_FILE_SIZE_FOR_THUMBNAIL) {
-    console.log("[Thumbnail] Skipping large file:", filePath);
     return null;
   }
 
@@ -87,7 +87,11 @@ async function extractVideoThumbnail(filePath: string): Promise<Blob | null> {
   const blobUrl = URL.createObjectURL(videoBlob);
 
   try {
-    return await captureFrame(blobUrl);
+    const result = await captureFrame(blobUrl);
+    if (!result) {
+      reportError({ type: "thumbnail", message: "Video captureFrame returned null", context: { path: filePath, step: "captureFrame", mimeType, byteLength: fileBytes.byteLength } });
+    }
+    return result;
   } finally {
     URL.revokeObjectURL(blobUrl);
   }
@@ -163,7 +167,7 @@ function captureFrame(videoUrl: string): Promise<Blob | null> {
     };
 
     video.addEventListener("error", () => {
-      console.warn("[Thumbnail] Video error:", video.error?.message);
+      reportError({ type: "thumbnail", message: `Video element error: ${video.error?.message || "unknown"}`, context: { step: "video_element", code: video.error?.code } });
       cleanup();
       resolve(null);
     });
@@ -226,12 +230,11 @@ async function extractImageThumbnail(filePath: string): Promise<Blob | null> {
     const bytes = await invoke<number[]>("read_file_bytes", { path: filePath });
     fileBytes = new Uint8Array(bytes);
   } catch (e) {
-    console.warn("[Thumbnail] Failed to read image:", e);
+    reportError({ type: "thumbnail", message: `Image read failed: ${e}`, context: { path: filePath, step: "read_file_bytes" } });
     return null;
   }
 
   if (fileBytes.byteLength < MIN_IMAGE_SIZE_FOR_THUMBNAIL) {
-    console.log("[Thumbnail] Image too small, skipping:", filePath);
     return null;
   }
 
@@ -240,7 +243,11 @@ async function extractImageThumbnail(filePath: string): Promise<Blob | null> {
   const blobUrl = URL.createObjectURL(imageBlob);
 
   try {
-    return await resizeImage(blobUrl);
+    const result = await resizeImage(blobUrl);
+    if (!result) {
+      reportError({ type: "thumbnail", message: "Image resizeImage returned null", context: { path: filePath, step: "resizeImage", mimeType, byteLength: fileBytes.byteLength } });
+    }
+    return result;
   } finally {
     URL.revokeObjectURL(blobUrl);
   }
@@ -261,7 +268,7 @@ function resizeImage(imageUrl: string): Promise<Blob | null> {
 
     img.addEventListener("error", () => {
       clearTimeout(timeout);
-      console.warn("[Thumbnail] Image load error");
+      reportError({ type: "thumbnail", message: "Image element load error", context: { step: "img_element", src: imageUrl.substring(0, 50) } });
       resolve(null);
     });
 
