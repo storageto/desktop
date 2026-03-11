@@ -3,7 +3,6 @@ import { reportError } from "./errorReporter";
 
 const VIDEO_EXTENSIONS = [".mp4", ".webm", ".mov"];
 const IMAGE_EXTENSIONS = [".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff", ".tif"];
-const MIN_IMAGE_SIZE_FOR_THUMBNAIL = 256 * 1024; // 256KB
 const THUMBNAIL_TIMEOUT_MS = 8000;
 const THUMBNAIL_MAX_WIDTH = 1280;
 const THUMBNAIL_JPEG_QUALITY = 0.85;
@@ -70,8 +69,10 @@ async function extractVideoThumbnail(filePath: string): Promise<Blob | null> {
   // Read the file using Rust command (bypasses fs plugin scope restrictions)
   let fileBytes: Uint8Array;
   try {
-    const bytes = await invoke<number[]>("read_file_bytes", { path: filePath });
-    fileBytes = new Uint8Array(bytes);
+    const b64 = await invoke<string>("read_file_bytes", { path: filePath });
+    const binary = atob(b64);
+    fileBytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) fileBytes[i] = binary.charCodeAt(i);
   } catch (e) {
     reportError({ type: "thumbnail", message: `Video read failed: ${e}`, context: { path: filePath, step: "read_file_bytes" } });
     return null;
@@ -79,6 +80,7 @@ async function extractVideoThumbnail(filePath: string): Promise<Blob | null> {
 
   // Skip very large files to avoid memory pressure
   if (fileBytes.byteLength > MAX_FILE_SIZE_FOR_THUMBNAIL) {
+    reportError({ type: "thumbnail", message: "Video too large, skipped", context: { path: filePath, step: "size_check", byteLength: fileBytes.byteLength } });
     return null;
   }
 
@@ -105,7 +107,7 @@ async function extractVideoThumbnail(filePath: string): Promise<Blob | null> {
 function captureFrame(videoUrl: string): Promise<Blob | null> {
   return new Promise((resolve) => {
     const timeout = setTimeout(() => {
-      console.warn("[Thumbnail] Timed out");
+      reportError({ type: "thumbnail", message: "Video captureFrame timed out", context: { step: "captureFrame_timeout" } });
       cleanup();
       resolve(null);
     }, THUMBNAIL_TIMEOUT_MS);
@@ -134,7 +136,7 @@ function captureFrame(videoUrl: string): Promise<Blob | null> {
         const w = video.videoWidth;
         const h = video.videoHeight;
         if (!w || !h) {
-          console.warn("[Thumbnail] No video dimensions");
+          reportError({ type: "thumbnail", message: "No video dimensions", context: { step: "capture_dimensions", w, h } });
           cleanup();
           resolve(null);
           return;
@@ -160,7 +162,7 @@ function captureFrame(videoUrl: string): Promise<Blob | null> {
           THUMBNAIL_JPEG_QUALITY
         );
       } catch (e) {
-        console.warn("[Thumbnail] Canvas error:", e);
+        reportError({ type: "thumbnail", message: `Video canvas error: ${e}`, context: { step: "capture_canvas" } });
         cleanup();
         resolve(null);
       }
@@ -227,14 +229,12 @@ function getImageMimeType(path: string): string {
 async function extractImageThumbnail(filePath: string): Promise<Blob | null> {
   let fileBytes: Uint8Array;
   try {
-    const bytes = await invoke<number[]>("read_file_bytes", { path: filePath });
-    fileBytes = new Uint8Array(bytes);
+    const b64 = await invoke<string>("read_file_bytes", { path: filePath });
+    const binary = atob(b64);
+    fileBytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) fileBytes[i] = binary.charCodeAt(i);
   } catch (e) {
     reportError({ type: "thumbnail", message: `Image read failed: ${e}`, context: { path: filePath, step: "read_file_bytes" } });
-    return null;
-  }
-
-  if (fileBytes.byteLength < MIN_IMAGE_SIZE_FOR_THUMBNAIL) {
     return null;
   }
 
@@ -254,13 +254,12 @@ async function extractImageThumbnail(filePath: string): Promise<Blob | null> {
 }
 
 /**
- * Load an image, scale it down to max width, and return as JPEG blob.
- * Returns null if image is already <= max width.
+ * Load an image, scale down if wider than max width, and return as JPEG blob.
  */
 function resizeImage(imageUrl: string): Promise<Blob | null> {
   return new Promise((resolve) => {
     const timeout = setTimeout(() => {
-      console.warn("[Thumbnail] Image resize timed out");
+      reportError({ type: "thumbnail", message: "Image resize timed out", context: { step: "resizeImage_timeout" } });
       resolve(null);
     }, THUMBNAIL_TIMEOUT_MS);
 
@@ -274,18 +273,17 @@ function resizeImage(imageUrl: string): Promise<Blob | null> {
 
     img.addEventListener("load", () => {
       try {
-        if (img.naturalWidth <= THUMBNAIL_MAX_WIDTH) {
-          clearTimeout(timeout);
-          console.log("[Thumbnail] Image already small enough, skipping");
-          resolve(null);
-          return;
-        }
-
         const canvas = document.createElement("canvas");
-        const ratio = THUMBNAIL_MAX_WIDTH / img.naturalWidth;
-        canvas.width = THUMBNAIL_MAX_WIDTH;
-        canvas.height = Math.round(img.naturalHeight * ratio);
-        canvas.getContext("2d")!.drawImage(img, 0, 0, canvas.width, canvas.height);
+        let width = img.naturalWidth;
+        let height = img.naturalHeight;
+        if (width > THUMBNAIL_MAX_WIDTH) {
+          const ratio = THUMBNAIL_MAX_WIDTH / width;
+          width = THUMBNAIL_MAX_WIDTH;
+          height = Math.round(height * ratio);
+        }
+        canvas.width = width;
+        canvas.height = height;
+        canvas.getContext("2d")!.drawImage(img, 0, 0, width, height);
 
         canvas.toBlob(
           (blob) => {
@@ -297,7 +295,7 @@ function resizeImage(imageUrl: string): Promise<Blob | null> {
         );
       } catch (e) {
         clearTimeout(timeout);
-        console.warn("[Thumbnail] Image canvas error:", e);
+        reportError({ type: "thumbnail", message: `Image canvas error: ${e}`, context: { step: "resizeImage_canvas" } });
         resolve(null);
       }
     });
@@ -382,7 +380,6 @@ export async function generateThumbnailIcons(
     if (!isVideo && !isImage) continue;
 
     try {
-      console.log("[Thumbnail] Extracting thumbnail for:", path);
       const blob = isVideo
         ? await extractVideoThumbnail(path)
         : await extractImageThumbnail(path);
@@ -401,7 +398,7 @@ export async function generateThumbnailIcons(
         await invoke("set_history_thumbnail", { url, thumbnailUrl: dataUrl }).catch(() => {});
       }
     } catch (e) {
-      console.warn("[Thumbnail] Icon generation failed for", path, e);
+      reportError({ type: "thumbnail", message: `Thumbnail generation threw: ${e}`, context: { path, step: "generateThumbnailIcons_catch" } });
     }
   }
 

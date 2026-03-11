@@ -302,7 +302,10 @@ function App() {
         const fileUrls = fileResults.map(r => r.url);
         let thumbnailBlobs = new Map<string, Blob>();
         if (fileUrls.length > 0) {
-          thumbnailBlobs = await generateThumbnailIcons(paths, fileUrls).catch(() => new Map());
+          thumbnailBlobs = await generateThumbnailIcons(paths, fileUrls).catch((e) => {
+            reportError({ type: "thumbnail", message: `generateThumbnailIcons crashed: ${e}`, stack: e instanceof Error ? e.stack : undefined, context: { step: "app_catch", fileCount: paths.length } });
+            return new Map();
+          });
         }
 
         // Refresh history (icons already saved, so thumbnails show immediately)

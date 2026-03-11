@@ -1242,8 +1242,9 @@ async fn logout(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn read_file_bytes(path: String) -> Result<Vec<u8>, String> {
-    tokio::fs::read(&path).await.map_err(|e| format!("Failed to read {}: {}", path, e))
+async fn read_file_bytes(path: String) -> Result<String, String> {
+    let bytes = tokio::fs::read(&path).await.map_err(|e| format!("Failed to read {}: {}", path, e))?;
+    Ok(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes))
 }
 
 /// Send analytics event to API
