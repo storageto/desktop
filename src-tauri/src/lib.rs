@@ -1326,23 +1326,22 @@ fn start_update_checker(app_handle: AppHandle) {
                 Ok(updater) => {
                     match updater.check().await {
                         Ok(Some(update)) => {
-                            let version = update.version.clone();
-                            eprintln!("[Updater] Update available: {}", version);
+                            let new_version = update.version.clone();
+                            eprintln!("[Updater] Update available: {}", new_version);
 
-                            // Download the update in background
                             match update.download_and_install(|_, _| {}, || {}).await {
                                 Ok(_) => {
-                                    eprintln!("[Updater] Update downloaded, showing notification");
+                                    eprintln!("[Updater] Update downloaded");
 
-                                    // Show notification to user
+                                    // Persist so we can remind on next launch
+                                    let _ = storage::set_pending_update_version(Some(new_version.clone()));
+
                                     let _ = app_handle.notification()
                                         .builder()
                                         .title("Update Ready")
-                                        .body(format!("StorageTo v{} downloaded. Restart to apply.", version))
+                                        .body(format!("StorageTo v{} downloaded. Restart to apply.", new_version))
                                         .show();
-
-                                    // Emit event so frontend knows update is ready
-                                    let _ = app_handle.emit("update-ready", version);
+                                    let _ = app_handle.emit("update-ready", new_version);
                                 }
                                 Err(e) => {
                                     eprintln!("[Updater] Failed to download update: {}", e);
@@ -1651,6 +1650,28 @@ pub fn run() {
             // Start background update checker
             start_update_checker(app.handle().clone());
             eprintln!("[Updater] Background update checker started");
+
+            // Re-emit pending update on startup (in case user ignored the notification last session)
+            {
+                let startup_handle = app.handle().clone();
+                let current_version = app.package_info().version.to_string();
+                tauri::async_runtime::spawn(async move {
+                    // Wait for frontend to initialize before emitting
+                    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                    match storage::get_pending_update_version() {
+                        Some(pending) if pending == current_version => {
+                            // Update was applied - clear the flag
+                            let _ = storage::set_pending_update_version(None);
+                            eprintln!("[Updater] Pending update {} was applied, clearing flag", pending);
+                        }
+                        Some(pending) => {
+                            eprintln!("[Updater] Pending update {} still waiting for restart", pending);
+                            let _ = startup_handle.emit("update-ready", pending);
+                        }
+                        None => {}
+                    }
+                });
+            }
 
             Ok(())
         })

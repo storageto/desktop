@@ -50,6 +50,8 @@ pub struct AppConfig {
     pub screenshot_shortcut: Option<String>,
     #[serde(default)]
     pub auth_token: Option<String>,
+    #[serde(default)]
+    pub pending_update_version: Option<String>,
 }
 
 impl AppConfig {
@@ -64,6 +66,7 @@ impl AppConfig {
             default_expiry_days: None,
             screenshot_shortcut: None,
             auth_token: None,
+            pending_update_version: None,
         }
     }
 }
@@ -228,4 +231,14 @@ pub fn update_history_item_protection(
     }
 
     save_config(&config)
+}
+
+pub fn set_pending_update_version(version: Option<String>) -> Result<(), String> {
+    let mut config = load_config();
+    config.pending_update_version = version;
+    save_config(&config)
+}
+
+pub fn get_pending_update_version() -> Option<String> {
+    load_config().pending_update_version
 }
