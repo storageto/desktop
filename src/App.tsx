@@ -376,9 +376,16 @@ function App() {
       // Track analytics
       trackScreenshotComplete();
 
+      // Generate and upload thumbnail (same as regular image uploads)
+      const thumbnailBlobs = await generateThumbnailIcons([screenshotPath], [result.url]).catch(() => new Map<string, Blob>());
+
       // Refresh history first, then clear uploads so file doesn't vanish
       await loadHistory();
       setUploads([]);
+
+      if (thumbnailBlobs.size > 0) {
+        uploadThumbnails(thumbnailBlobs).catch(() => {});
+      }
     } catch (err) {
       console.error("[Screenshot] Error:", err);
       const rawError = String(err);

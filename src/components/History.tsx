@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, type ReactElement } from "react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useFloating, offset, flip, shift, autoUpdate, FloatingPortal } from "@floating-ui/react";
@@ -109,8 +109,8 @@ function getExpiryInfo(expiresAt: string): ExpiryInfo {
   }
 
   const diffMins = Math.floor(diffMs / 60000);
-  const diffHours = Math.floor(diffMs / 3600000);
-  const diffDays = Math.floor(diffMs / 86400000);
+  const diffHours = Math.round(diffMs / 3600000);
+  const diffDays = Math.floor(diffHours / 24);
   const remainingHours = diffHours % 24;
 
   // Calculate percent remaining (assuming 3 day = 72 hour max)
@@ -172,6 +172,117 @@ function ExpiryBadge({ expiresAt }: { expiresAt: string }) {
   );
 }
 
+type FileCategory = "image" | "audio" | "video" | "archive" | "document" | "spreadsheet" | "presentation" | "code" | "executable";
+
+const EXT_CATEGORY: Record<string, FileCategory> = {
+  // images
+  jpg: "image", jpeg: "image", png: "image", gif: "image", webp: "image",
+  svg: "image", bmp: "image", tiff: "image", tif: "image", ico: "image",
+  heic: "image", heif: "image", avif: "image",
+  // audio
+  mp3: "audio", wav: "audio", aac: "audio", flac: "audio", ogg: "audio",
+  m4a: "audio", wma: "audio", opus: "audio", aiff: "audio",
+  // video
+  mp4: "video", mov: "video", avi: "video", mkv: "video", webm: "video",
+  wmv: "video", flv: "video", m4v: "video",
+  // archives
+  zip: "archive", rar: "archive", "7z": "archive", tar: "archive",
+  gz: "archive", bz2: "archive", xz: "archive",
+  // executables
+  dmg: "executable", pkg: "executable", exe: "executable", msi: "executable",
+  deb: "executable", rpm: "executable",
+  // documents
+  pdf: "document", doc: "document", docx: "document", txt: "document",
+  rtf: "document", md: "document", odt: "document", pages: "document",
+  // spreadsheets
+  xls: "spreadsheet", xlsx: "spreadsheet", csv: "spreadsheet",
+  ods: "spreadsheet", numbers: "spreadsheet",
+  // presentations
+  ppt: "presentation", pptx: "presentation", key: "presentation", odp: "presentation",
+  // code
+  js: "code", ts: "code", tsx: "code", jsx: "code", py: "code", rb: "code",
+  go: "code", rs: "code", java: "code", c: "code", cpp: "code", h: "code",
+  cs: "code", css: "code", html: "code", json: "code", xml: "code",
+  yaml: "code", yml: "code", sh: "code", bash: "code", sql: "code",
+  php: "code", swift: "code", kt: "code", vue: "code", svelte: "code",
+  toml: "code", env: "code",
+};
+
+const CATEGORY_ICONS: Record<FileCategory, { color: string; render: (cls: string) => ReactElement }> = {
+  image: {
+    color: "text-pink-500",
+    render: (cls) => (
+      <svg className={cls} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+      </svg>
+    ),
+  },
+  audio: {
+    color: "text-green-500",
+    render: (cls) => (
+      <svg className={cls} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3" />
+      </svg>
+    ),
+  },
+  video: {
+    color: "text-purple-500",
+    render: (cls) => (
+      <svg className={cls} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+      </svg>
+    ),
+  },
+  archive: {
+    color: "text-orange-500",
+    render: (cls) => (
+      <svg className={cls} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 8h14M5 8a2 2 0 110-4h14a2 2 0 110 4M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8m-9 4h4" />
+      </svg>
+    ),
+  },
+  document: {
+    color: "text-blue-500",
+    render: (cls) => (
+      <svg className={cls} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+      </svg>
+    ),
+  },
+  spreadsheet: {
+    color: "text-emerald-500",
+    render: (cls) => (
+      <svg className={cls} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+      </svg>
+    ),
+  },
+  presentation: {
+    color: "text-amber-500",
+    render: (cls) => (
+      <svg className={cls} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+      </svg>
+    ),
+  },
+  code: {
+    color: "text-cyan-400",
+    render: (cls) => (
+      <svg className={cls} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4" />
+      </svg>
+    ),
+  },
+  executable: {
+    color: "text-stone-400",
+    render: (cls) => (
+      <svg className={cls} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+      </svg>
+    ),
+  },
+};
+
 function getFileIcon(filename: string, isCollection: boolean, size: "sm" | "md" = "md") {
   const sizeClass = size === "sm" ? "w-3 h-3" : "w-4 h-4";
 
@@ -183,45 +294,14 @@ function getFileIcon(filename: string, isCollection: boolean, size: "sm" | "md" 
     );
   }
 
-  const ext = filename.split(".").pop()?.toLowerCase();
+  const ext = filename.split(".").pop()?.toLowerCase() ?? "";
+  const category = EXT_CATEGORY[ext];
+  const icon = category ? CATEGORY_ICONS[category] : null;
 
-  // Image files
-  if (["jpg", "jpeg", "png", "gif", "webp", "svg", "bmp"].includes(ext || "")) {
-    return (
-      <svg className={`${sizeClass} text-pink-500`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
-      </svg>
-    );
+  if (icon) {
+    return icon.render(`${sizeClass} ${icon.color}`);
   }
 
-  // Video files
-  if (["mp4", "mov", "avi", "mkv", "webm"].includes(ext || "")) {
-    return (
-      <svg className={`${sizeClass} text-purple-500`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
-      </svg>
-    );
-  }
-
-  // Archive files
-  if (["zip", "rar", "7z", "tar", "gz"].includes(ext || "")) {
-    return (
-      <svg className={`${sizeClass} text-orange-500`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 8h14M5 8a2 2 0 110-4h14a2 2 0 110 4M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8m-9 4h4" />
-      </svg>
-    );
-  }
-
-  // Document files
-  if (["pdf", "doc", "docx", "txt", "rtf"].includes(ext || "")) {
-    return (
-      <svg className={`${sizeClass} text-blue-500`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-      </svg>
-    );
-  }
-
-  // Default file icon
   return (
     <svg className={`${sizeClass} text-[#71717a]`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
@@ -564,6 +644,12 @@ function ContextMenu({
 }
 
 export function History({ items, uploads, onDelete, onClearUploads, onSetPassword, onRemovePassword, onSetExpiry, onSetBurnAfterReading, onRemoveBurnAfterReading }: HistoryProps) {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const interval = setInterval(() => setTick(t => t + 1), 60_000);
+    return () => clearInterval(interval);
+  }, []);
+
   const [deleteConfirm, setDeleteConfirm] = useState<{ fileId: string; url: string; filename: string; isCollection: boolean } | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
   const [expandedCollections, setExpandedCollections] = useState<Set<string>>(new Set());

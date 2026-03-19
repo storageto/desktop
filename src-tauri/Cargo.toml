@@ -1,6 +1,6 @@
 [package]
 name = "storageto-desktop"
-version = "0.2.30"
+version = "0.2.31"
 description = "StorageTo Desktop - Upload files from your menu bar"
 authors = ["StorageTo"]
 edition = "2021"
