@@ -30,6 +30,13 @@ struct AppState {
     config: Mutex<AppConfig>,
     /// Flag to signal upload cancellation - checked between files/chunks
     upload_cancelled: Arc<AtomicBool>,
+    /// When false, the window will not auto-hide on blur (e.g. during file picker or drag)
+    blur_hide_enabled: Arc<AtomicBool>,
+}
+
+#[tauri::command]
+fn set_blur_hide_enabled(state: State<AppState>, enabled: bool) {
+    state.blur_hide_enabled.store(enabled, Ordering::SeqCst);
 }
 
 /// Cancel any in-progress upload
@@ -58,7 +65,7 @@ async fn apply_default_expiry(url: &str, is_collection: bool, days: u32) {
     }
 
     eprintln!("[Expiry] Applying default expiry of {} days to {}", days, file_id);
-    match upload::set_expiry(file_id.to_string(), is_collection, days).await {
+    match upload::set_expiry(file_id.to_string(), is_collection, Some(days)).await {
         Ok(()) => eprintln!("[Expiry] Default expiry applied successfully"),
         Err(e) => eprintln!("[Expiry] Failed to apply default expiry: {}", e),
     }
@@ -84,12 +91,14 @@ async fn upload_single_file(
 
     let result = upload_file(path, None, on_progress, None).await?;
 
-    // Apply default expiry if configured
+    // Apply default expiry if configured (0 = permanent, skip the call — file is already permanent from confirm)
     if let Some(days) = default_expiry {
-        apply_default_expiry(&result.url, false, days).await;
-        // Update local history to reflect the actual expiry
-        let new_expires = Utc::now() + chrono::Duration::days(days as i64);
-        let _ = storage::update_history_item_protection(&result.url, None, None, Some(new_expires));
+        if days > 0 {
+            apply_default_expiry(&result.url, false, days).await;
+            // Update local history to reflect the actual expiry
+            let new_expires = Utc::now() + chrono::Duration::days(days as i64);
+            let _ = storage::update_history_item_protection(&result.url, None, None, Some(new_expires));
+        }
     }
 
     Ok(result)
@@ -143,11 +152,13 @@ async fn upload_files(
         }
         let result = upload_file(paths[0].clone(), None, on_progress, None).await?;
 
-        // Apply default expiry if configured
+        // Apply default expiry if configured (0 = permanent, skip)
         if let Some(days) = default_expiry {
-            apply_default_expiry(&result.url, false, days).await;
-            let new_expires = Utc::now() + chrono::Duration::days(days as i64);
-            let _ = storage::update_history_item_protection(&result.url, None, None, Some(new_expires));
+            if days > 0 {
+                apply_default_expiry(&result.url, false, days).await;
+                let new_expires = Utc::now() + chrono::Duration::days(days as i64);
+                let _ = storage::update_history_item_protection(&result.url, None, None, Some(new_expires));
+            }
         }
 
         return Ok(vec![result]);
@@ -156,13 +167,15 @@ async fn upload_files(
     // Multiple files - use batch upload
     let results = upload_files_batch(paths, on_progress, cancel_flag).await?;
 
-    // Apply default expiry to the collection if configured
+    // Apply default expiry to the collection if configured (0 = permanent, skip)
     if let Some(days) = default_expiry {
-        if let Some(last) = results.last() {
-            if last.is_collection {
-                apply_default_expiry(&last.url, true, days).await;
-                let new_expires = Utc::now() + chrono::Duration::days(days as i64);
-                let _ = storage::update_history_item_protection(&last.url, None, None, Some(new_expires));
+        if days > 0 {
+            if let Some(last) = results.last() {
+                if last.is_collection {
+                    apply_default_expiry(&last.url, true, days).await;
+                    let new_expires = Utc::now() + chrono::Duration::days(days as i64);
+                    let _ = storage::update_history_item_protection(&last.url, None, None, Some(new_expires));
+                }
             }
         }
     }
@@ -897,11 +910,13 @@ async fn upload_folder(
         file_count: Some(success_count),
     };
 
-    // Apply default expiry if configured
+    // Apply default expiry if configured (0 = permanent, skip)
     if let Some(days) = default_expiry {
-        apply_default_expiry(&result.url, true, days).await;
-        let new_expires = Utc::now() + chrono::Duration::days(days as i64);
-        let _ = storage::update_history_item_protection(&result.url, None, None, Some(new_expires));
+        if days > 0 {
+            apply_default_expiry(&result.url, true, days).await;
+            let new_expires = Utc::now() + chrono::Duration::days(days as i64);
+            let _ = storage::update_history_item_protection(&result.url, None, None, Some(new_expires));
+        }
     }
 
     Ok(result)
@@ -969,7 +984,7 @@ async fn set_file_password(file_id: String, is_collection: bool, password: Strin
 }
 
 #[tauri::command]
-async fn set_file_expiry(file_id: String, is_collection: bool, days: u32) -> Result<(), String> {
+async fn set_file_expiry(file_id: String, is_collection: bool, days: Option<u32>) -> Result<(), String> {
     upload::set_expiry(file_id, is_collection, days).await
 }
 
@@ -1197,6 +1212,7 @@ async fn get_auth_status(state: State<'_, AppState>) -> Result<serde_json::Value
                     "logged_in": true,
                     "email": user.get("email").and_then(|v| v.as_str()),
                     "name": user.get("name").and_then(|v| v.as_str()),
+                    "is_premium": user.get("is_premium").and_then(|v| v.as_bool()).unwrap_or(false),
                 }));
             }
         }
@@ -1212,6 +1228,41 @@ async fn get_auth_status(state: State<'_, AppState>) -> Result<serde_json::Value
 
     // API unreachable but we have a token — show logged in without details
     Ok(serde_json::json!({ "logged_in": true }))
+}
+
+/// On first login, if the user is premium and hasn't set a default expiry preference,
+/// auto-set it to 0 (permanent) so their uploads stay forever by default.
+async fn set_permanent_default_if_premium_first_login(app: &AppHandle, token: &str) {
+    let api_url = get_api_url();
+    let client = reqwest::Client::new();
+    let Ok(resp) = client
+        .get(format!("{}/api/user", api_url))
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Accept", "application/json")
+        .send()
+        .await
+    else {
+        return;
+    };
+
+    if !resp.status().is_success() {
+        return;
+    }
+
+    let Ok(user) = resp.json::<serde_json::Value>().await else {
+        return;
+    };
+
+    if user.get("is_premium").and_then(|v| v.as_bool()).unwrap_or(false) {
+        let state: State<AppState> = app.state();
+        let mut config = state.config.lock().unwrap();
+        // Only set if the user hasn't already chosen a preference
+        if config.default_expiry_days.is_none() {
+            config.default_expiry_days = Some(0);
+            let _ = save_config(&config);
+            eprintln!("[Auth] Premium user — default expiry set to permanent");
+        }
+    }
 }
 
 /// Logout - revoke token on API then clear locally
@@ -1433,6 +1484,29 @@ fn show_window_at_tray(app: &AppHandle, tray_x: f64, tray_y: f64, tray_width: f6
     }
 }
 
+/// Returns true if the left mouse button is currently held down (i.e. a drag is in progress).
+fn is_drag_in_progress() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        #[link(name = "CoreGraphics", kind = "framework")]
+        extern "C" {
+            fn CGEventSourceButtonState(state_id: i32, button: u32) -> bool;
+        }
+        unsafe { CGEventSourceButtonState(0, 0) }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        extern "system" {
+            fn GetAsyncKeyState(v_key: i32) -> i16;
+        }
+        unsafe { GetAsyncKeyState(0x01) & (0x8000u16 as i16) != 0 }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        false
+    }
+}
+
 fn hide_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.hide();
@@ -1468,16 +1542,65 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, None))
-        .plugin(tauri_plugin_deep_link::init());
+        .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            // Second instance launched — show and focus existing window
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+
+            // On Windows, deep link URLs are passed as CLI args to the new instance.
+            // Since we blocked that instance, process any storageto:// URL ourselves.
+            for arg in &argv {
+                if arg.starts_with("storageto://") {
+                    if let Ok(url) = url::Url::parse(arg) {
+                        if url.scheme() == "storageto" && url.host_str() == Some("auth") {
+                            for (key, value) in url.query_pairs() {
+                                if key == "token" {
+                                    eprintln!("[DeepLink] Auth token received via single-instance argv");
+                                    let token = value.to_string();
+                                    let state: tauri::State<AppState> = app.state();
+                                    let mut config = state.config.lock().unwrap();
+                                    config.auth_token = Some(token.clone());
+                                    let _ = save_config(&config);
+                                    drop(config);
+                                    let _ = app.emit("auth-token-received", ());
+
+                                    let first_login_handle = app.clone();
+                                    tauri::async_runtime::spawn(async move {
+                                        set_permanent_default_if_premium_first_login(&first_login_handle, &token).await;
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }));
 
     #[cfg(target_os = "macos")]
     {
         builder = builder.plugin(tauri_plugin_macos_permissions::init());
     }
 
-    builder.manage(AppState {
+    builder.on_window_event(|window, event| {
+            if let tauri::WindowEvent::Focused(false) = event {
+                let app = window.app_handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    // Short delay so drag-enter and file-picker guards have time to fire
+                    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+                    let state: State<AppState> = app.state();
+                    if state.blur_hide_enabled.load(Ordering::SeqCst) {
+                        hide_window(&app);
+                    }
+                });
+            }
+        })
+        .manage(AppState {
             config: Mutex::new(config),
             upload_cancelled: Arc::new(AtomicBool::new(false)),
+            blur_hide_enabled: Arc::new(AtomicBool::new(true)),
         })
         .setup(|app| {
             // Hide dock icon - this is a menu bar app only
@@ -1540,7 +1663,6 @@ pub fn run() {
                                 if window.is_visible().unwrap_or(false) {
                                     hide_window(app);
                                 } else {
-                                    // Get physical position and size from rect
                                     let (pos_x, pos_y) = match rect.position {
                                         tauri::Position::Physical(p) => (p.x as f64, p.y as f64),
                                         tauri::Position::Logical(l) => (l.x, l.y),
@@ -1549,8 +1671,26 @@ pub fn run() {
                                         tauri::Size::Physical(s) => (s.width as f64, s.height as f64),
                                         tauri::Size::Logical(l) => (l.width, l.height),
                                     };
-                                    // Position window below tray icon
                                     show_window_at_tray(app, pos_x, pos_y, size_w, size_h);
+                                }
+                            }
+                        }
+                        // Show window when dragging files over the tray icon
+                        TrayIconEvent::Enter { rect, .. } => {
+                            if is_drag_in_progress() {
+                                let app = tray.app_handle().clone();
+                                if let Some(window) = app.get_webview_window("main") {
+                                    if !window.is_visible().unwrap_or(true) {
+                                        let (pos_x, pos_y) = match rect.position {
+                                            tauri::Position::Physical(p) => (p.x as f64, p.y as f64),
+                                            tauri::Position::Logical(l) => (l.x, l.y),
+                                        };
+                                        let (size_w, size_h) = match rect.size {
+                                            tauri::Size::Physical(s) => (s.width as f64, s.height as f64),
+                                            tauri::Size::Logical(l) => (l.width, l.height),
+                                        };
+                                        show_window_at_tray(&app, pos_x, pos_y, size_w, size_h);
+                                    }
                                 }
                             }
                         }
@@ -1632,6 +1772,12 @@ pub fn run() {
                                             let _ = window.set_focus();
                                         }
                                         let _ = deep_link_handle.emit("auth-token-received", ());
+
+                                        // Auto-set permanent expiry on first login if premium
+                                        let first_login_handle = deep_link_handle.clone();
+                                        tauri::async_runtime::spawn(async move {
+                                            set_permanent_default_if_premium_first_login(&first_login_handle, &token).await;
+                                        });
                                     }
                                 }
                             }
@@ -1702,6 +1848,7 @@ pub fn run() {
             get_auth_status,
             logout,
             read_file_bytes,
+            set_blur_hide_enabled,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

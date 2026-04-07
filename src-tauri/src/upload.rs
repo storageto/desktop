@@ -1202,7 +1202,7 @@ pub async fn set_password(file_id: String, is_collection: bool, password: String
     Ok(())
 }
 
-pub async fn set_expiry(file_id: String, is_collection: bool, days: u32) -> Result<(), String> {
+pub async fn set_expiry(file_id: String, is_collection: bool, days: Option<u32>) -> Result<(), String> {
     let client = get_client();
     let api_url = get_api_url();
 
@@ -1215,7 +1215,7 @@ pub async fn set_expiry(file_id: String, is_collection: bool, days: u32) -> Resu
 
     #[derive(Serialize)]
     struct ExpiryRequest {
-        days: u32,
+        days: Option<u32>,
     }
 
     let response = client

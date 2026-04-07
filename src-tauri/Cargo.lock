@@ -4188,7 +4188,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "storageto-desktop"
-version = "0.2.30"
+version = "0.2.31"
 dependencies = [
  "async-stream",
  "base64 0.22.1",
@@ -4217,6 +4217,7 @@ dependencies = [
  "tauri-plugin-opener",
  "tauri-plugin-process",
  "tauri-plugin-screenshots",
+ "tauri-plugin-single-instance",
  "tauri-plugin-updater",
  "tokio",
  "url",
@@ -4728,6 +4729,21 @@ dependencies = [
  "tauri-plugin",
  "thiserror 2.0.18",
  "xcap",
+]
+
+[[package]]
+name = "tauri-plugin-single-instance"
+version = "2.3.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "acba6b5ca527a96cdfcc96ae09b09ccb91ddff5e33978ca6873b96ea16bb404c"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tauri",
+ "thiserror 2.0.18",
+ "tracing",
+ "windows-sys 0.60.2",
+ "zbus",
 ]
 
 [[package]]

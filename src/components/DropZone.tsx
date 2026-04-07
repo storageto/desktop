@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 import clsx from "clsx";
 
 interface DropZoneProps {
@@ -27,6 +28,7 @@ export function DropZone({ onFilesSelected, disabled }: DropZoneProps) {
       // Listen for file drop
       unlistenDrop = await listen<DragDropPayload>("tauri://drag-drop", (event) => {
         setIsDragOver(false);
+        invoke("set_blur_hide_enabled", { enabled: true }).catch(() => {});
 
         // Debounce: ignore drops within 500ms of each other
         const now = Date.now();
@@ -40,16 +42,18 @@ export function DropZone({ onFilesSelected, disabled }: DropZoneProps) {
         }
       });
 
-      // Listen for drag hover (files entered window)
+      // Listen for drag hover — suspend blur-hide so window doesn't close mid-drag
       unlistenHover = await listen("tauri://drag-enter", () => {
+        invoke("set_blur_hide_enabled", { enabled: false }).catch(() => {});
         if (!disabled) {
           setIsDragOver(true);
         }
       });
 
-      // Listen for drag leave (files left window)
+      // Listen for drag leave
       unlistenLeave = await listen("tauri://drag-leave", () => {
         setIsDragOver(false);
+        invoke("set_blur_hide_enabled", { enabled: true }).catch(() => {});
       });
     };
 
@@ -82,6 +86,9 @@ export function DropZone({ onFilesSelected, disabled }: DropZoneProps) {
   const handleClick = useCallback(async () => {
     if (disabled) return;
 
+    // Suspend blur-hide while the native file picker is open
+    await invoke("set_blur_hide_enabled", { enabled: false }).catch(() => {});
+
     try {
       const selected = await open({
         multiple: true,
@@ -96,6 +103,8 @@ export function DropZone({ onFilesSelected, disabled }: DropZoneProps) {
       }
     } catch (err) {
       console.error("Failed to open file dialog:", err);
+    } finally {
+      invoke("set_blur_hide_enabled", { enabled: true }).catch(() => {});
     }
   }, [onFilesSelected, disabled]);
 

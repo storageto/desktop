@@ -68,7 +68,7 @@ export function Settings({ isOpen, onClose, appVersion, addToast }: SettingsProp
   const [autostart, setAutostart] = useState(false);
   const [recording, setRecording] = useState(false);
   const [recordedKeys, setRecordedKeys] = useState<string[]>([]);
-  const [authStatus, setAuthStatus] = useState<{ logged_in: boolean; email?: string; name?: string }>({ logged_in: false });
+  const [authStatus, setAuthStatus] = useState<{ logged_in: boolean; email?: string; name?: string; is_premium?: boolean }>({ logged_in: false });
 
   const loadConfig = useCallback(async () => {
     try {
@@ -90,7 +90,7 @@ export function Settings({ isOpen, onClose, appVersion, addToast }: SettingsProp
 
   const loadAuthStatus = useCallback(async () => {
     try {
-      const status = await invoke<{ logged_in: boolean; email?: string; name?: string }>("get_auth_status");
+      const status = await invoke<{ logged_in: boolean; email?: string; name?: string; is_premium?: boolean }>("get_auth_status");
       setAuthStatus(status);
     } catch (e) {
       console.error("Failed to load auth status:", e);
@@ -266,7 +266,12 @@ export function Settings({ isOpen, onClose, appVersion, addToast }: SettingsProp
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
                           </svg>
                         </div>
-                        <span className="text-sm text-white truncate">{authStatus.email || "Logged in"}</span>
+                        <div className="min-w-0">
+                          <span className="text-sm text-white truncate block">{authStatus.email || "Logged in"}</span>
+                          {authStatus.is_premium && (
+                            <span className="text-[10px] font-medium text-amber-400">Premium</span>
+                          )}
+                        </div>
                       </div>
                       <button
                         onClick={handleLogout}
@@ -325,15 +330,16 @@ export function Settings({ isOpen, onClose, appVersion, addToast }: SettingsProp
                     <div className="flex items-center justify-between mb-2">
                       <span className="text-sm text-[#e7e5e4]">Default expiry</span>
                     </div>
-                    <div className="flex gap-1.5">
+                    <div className="flex flex-wrap gap-1.5">
                       {EXPIRY_OPTIONS.map((opt) => {
                         const effectiveExpiry = config.default_expiry_days ?? 3;
+                        const isActive = effectiveExpiry === opt.value;
                         return (
                           <button
                             key={opt.label}
                             onClick={() => updateConfig({ default_expiry_days: opt.value })}
                             className={`px-2.5 py-1 rounded-md text-xs font-medium border transition-colors cursor-pointer ${
-                              effectiveExpiry === opt.value
+                              isActive
                                 ? "bg-amber-500/20 text-amber-400 border-amber-500/30"
                                 : "bg-[#1c1917] text-[#a8a29e] border-[#292524] hover:border-[#3f3f46] hover:text-white"
                             }`}
@@ -342,6 +348,26 @@ export function Settings({ isOpen, onClose, appVersion, addToast }: SettingsProp
                           </button>
                         );
                       })}
+                      {/* No expiry — premium only */}
+                      <button
+                        onClick={() => {
+                          if (authStatus.is_premium) {
+                            updateConfig({ default_expiry_days: 0 });
+                          } else {
+                            openUrl("https://storage.to/premium");
+                          }
+                        }}
+                        className={`px-2.5 py-1 rounded-md text-xs font-medium border transition-colors cursor-pointer flex items-center gap-1 ${
+                          config.default_expiry_days === 0
+                            ? "bg-amber-500/20 text-amber-400 border-amber-500/30"
+                            : authStatus.is_premium
+                              ? "bg-[#1c1917] text-[#a8a29e] border-[#292524] hover:border-[#3f3f46] hover:text-white"
+                              : "bg-[#1c1917] text-[#a8a29e]/50 border-[#292524] hover:border-amber-500/30 hover:text-amber-400/70"
+                        }`}
+                      >
+                        <span>No expiry</span>
+                        {!authStatus.is_premium && <span className="text-amber-500/60">★</span>}
+                      </button>
                     </div>
                   </div>
 

@@ -46,9 +46,10 @@ interface HistoryProps {
   onClearUploads?: () => void;
   onSetPassword: (fileId: string, isCollection: boolean, password: string) => void;
   onRemovePassword: (fileId: string, isCollection: boolean) => void;
-  onSetExpiry: (fileId: string, isCollection: boolean, days: number) => void;
+  onSetExpiry: (fileId: string, isCollection: boolean, days: number | null) => void;
   onSetBurnAfterReading: (fileId: string, isCollection: boolean) => void;
   onRemoveBurnAfterReading: (fileId: string, isCollection: boolean) => void;
+  isPremium?: boolean;
 }
 
 interface ModalState {
@@ -643,7 +644,7 @@ function ContextMenu({
   );
 }
 
-export function History({ items, uploads, onDelete, onClearUploads, onSetPassword, onRemovePassword, onSetExpiry, onSetBurnAfterReading, onRemoveBurnAfterReading }: HistoryProps) {
+export function History({ items, uploads, onDelete, onClearUploads, onSetPassword, onRemovePassword, onSetExpiry, onSetBurnAfterReading, onRemoveBurnAfterReading, isPremium }: HistoryProps) {
   const [, setTick] = useState(0);
   useEffect(() => {
     const interval = setInterval(() => setTick(t => t + 1), 60_000);
@@ -764,7 +765,7 @@ export function History({ items, uploads, onDelete, onClearUploads, onSetPasswor
     setPassword("");
   };
 
-  const handleExpirySubmit = (days: number) => {
+  const handleExpirySubmit = (days: number | null) => {
     if (!modal || modal.type !== "expiry") return;
     onSetExpiry(modal.fileId, modal.isCollection, days);
     setModal(null);
@@ -1230,6 +1231,22 @@ export function History({ items, uploads, onDelete, onClearUploads, onSetPasswor
                   {days} {days === 1 ? "day" : "days"}
                 </button>
               ))}
+              <button
+                onClick={() => {
+                  if (isPremium) {
+                    handleExpirySubmit(null);
+                  } else {
+                    openUrl("https://storage.to/premium");
+                  }
+                }}
+                className={`col-span-2 px-3 py-2.5 text-sm font-medium rounded-lg transition-colors cursor-pointer border ${
+                  isPremium
+                    ? "text-amber-400 bg-amber-500/10 border-amber-500/20 hover:bg-amber-500/20"
+                    : "text-amber-500/60 bg-[#1c1917] border-amber-500/20 hover:border-amber-500/40 hover:text-amber-400/80"
+                }`}
+              >
+                No expiry ∞{!isPremium && <span className="ml-1 text-[10px] opacity-70">Premium</span>}
+              </button>
             </div>
             <button
               onClick={() => setModal(null)}

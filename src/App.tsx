@@ -75,6 +75,7 @@ function App() {
   const [appVersion, setAppVersion] = useState<string | null>(null);
   const [updateReady, setUpdateReady] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [isPremium, setIsPremium] = useState(false);
   const { toasts, addToast, dismissToast } = useToast();
 
   // Derived: are there active uploads in progress?
@@ -97,6 +98,9 @@ function App() {
   useEffect(() => {
     loadHistory();
     getVersion().then(setAppVersion).catch(() => {});
+    invoke<{ logged_in: boolean; is_premium?: boolean }>("get_auth_status")
+      .then((s) => setIsPremium(s.logged_in && (s.is_premium ?? false)))
+      .catch(() => {});
   }, []);
 
   // Listen for update-ready event from Rust
@@ -109,6 +113,16 @@ function App() {
     return () => {
       unlisten.then((fn) => fn());
     };
+  }, []);
+
+  // Refresh premium status after login
+  useEffect(() => {
+    const unlisten = listen("auth-token-received", () => {
+      invoke<{ logged_in: boolean; is_premium?: boolean }>("get_auth_status")
+        .then((s) => setIsPremium(s.logged_in && (s.is_premium ?? false)))
+        .catch(() => {});
+    });
+    return () => { unlisten.then((fn) => fn()); };
   }, []);
 
   // Listen for open-settings event from tray menu
@@ -530,32 +544,42 @@ function App() {
     }
   };
 
-  const handleSetExpiry = async (fileId: string, isCollection: boolean, days: number) => {
+  const handleSetExpiry = async (fileId: string, isCollection: boolean, days: number | null) => {
     const url = getUrlFromFileId(fileId, isCollection);
+    const isPermanent = days === null;
 
-    // Calculate expiry date
-    const expiresAt = new Date();
-    expiresAt.setDate(expiresAt.getDate() + days);
-    const expiresAtStr = expiresAt.toISOString();
-
-    // Optimistic: update UI immediately (no toast yet)
-    updateHistoryItem(url, { expires_at: expiresAtStr });
+    // Optimistic UI update
+    if (isPermanent) {
+      updateHistoryItem(url, { expires_at: undefined });
+    } else {
+      const expiresAt = new Date();
+      expiresAt.setDate(expiresAt.getDate() + days!);
+      updateHistoryItem(url, { expires_at: expiresAt.toISOString() });
+    }
 
     try {
-      // Wait for API confirmation
       await invoke("set_file_expiry", { fileId, isCollection, days });
 
-      // Success - update local storage and show toast
+      const expiresAtStr = isPermanent ? null : (() => {
+        const d = new Date();
+        d.setDate(d.getDate() + days!);
+        return d.toISOString();
+      })();
+
       await invoke("update_history_protection", {
         url,
         passwordProtected: null,
         burnAfterReading: null,
         expiresAt: expiresAtStr,
       });
-      addToast({ title: "Expiry updated", description: `Expires in ${days} day${days > 1 ? 's' : ''}`, type: "success" });
+
+      addToast({
+        title: "Expiry updated",
+        description: isPermanent ? "File will never expire" : `Expires in ${days} day${days! > 1 ? 's' : ''}`,
+        type: "success",
+      });
     } catch (err) {
       console.error("Failed to set expiry:", err);
-      // Revert on failure
       updateHistoryItem(url, { expires_at: undefined });
       addToast({ title: "Failed to set expiry", description: "Please try again", type: "error" });
     }
@@ -684,6 +708,7 @@ function App() {
           onSetExpiry={handleSetExpiry}
           onSetBurnAfterReading={handleSetBurnAfterReading}
           onRemoveBurnAfterReading={handleRemoveBurnAfterReading}
+          isPremium={isPremium}
         />
 
         {/* Settings panel (slides over content) */}
