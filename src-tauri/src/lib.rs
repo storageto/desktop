@@ -30,13 +30,6 @@ struct AppState {
     config: Mutex<AppConfig>,
     /// Flag to signal upload cancellation - checked between files/chunks
     upload_cancelled: Arc<AtomicBool>,
-    /// When false, the window will not auto-hide on blur (e.g. during file picker or drag)
-    blur_hide_enabled: Arc<AtomicBool>,
-}
-
-#[tauri::command]
-fn set_blur_hide_enabled(state: State<AppState>, enabled: bool) {
-    state.blur_hide_enabled.store(enabled, Ordering::SeqCst);
 }
 
 /// Cancel any in-progress upload
@@ -1484,29 +1477,6 @@ fn show_window_at_tray(app: &AppHandle, tray_x: f64, tray_y: f64, tray_width: f6
     }
 }
 
-/// Returns true if the left mouse button is currently held down (i.e. a drag is in progress).
-fn is_drag_in_progress() -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        #[link(name = "CoreGraphics", kind = "framework")]
-        extern "C" {
-            fn CGEventSourceButtonState(state_id: i32, button: u32) -> bool;
-        }
-        unsafe { CGEventSourceButtonState(0, 0) }
-    }
-    #[cfg(target_os = "windows")]
-    {
-        extern "system" {
-            fn GetAsyncKeyState(v_key: i32) -> i16;
-        }
-        unsafe { GetAsyncKeyState(0x01) & (0x8000u16 as i16) != 0 }
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        false
-    }
-}
-
 fn hide_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.hide();
@@ -1584,23 +1554,9 @@ pub fn run() {
         builder = builder.plugin(tauri_plugin_macos_permissions::init());
     }
 
-    builder.on_window_event(|window, event| {
-            if let tauri::WindowEvent::Focused(false) = event {
-                let app = window.app_handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    // Short delay so drag-enter and file-picker guards have time to fire
-                    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-                    let state: State<AppState> = app.state();
-                    if state.blur_hide_enabled.load(Ordering::SeqCst) {
-                        hide_window(&app);
-                    }
-                });
-            }
-        })
-        .manage(AppState {
+    builder.manage(AppState {
             config: Mutex::new(config),
             upload_cancelled: Arc::new(AtomicBool::new(false)),
-            blur_hide_enabled: Arc::new(AtomicBool::new(true)),
         })
         .setup(|app| {
             // Hide dock icon - this is a menu bar app only
@@ -1672,25 +1628,6 @@ pub fn run() {
                                         tauri::Size::Logical(l) => (l.width, l.height),
                                     };
                                     show_window_at_tray(app, pos_x, pos_y, size_w, size_h);
-                                }
-                            }
-                        }
-                        // Show window when dragging files over the tray icon
-                        TrayIconEvent::Enter { rect, .. } => {
-                            if is_drag_in_progress() {
-                                let app = tray.app_handle().clone();
-                                if let Some(window) = app.get_webview_window("main") {
-                                    if !window.is_visible().unwrap_or(true) {
-                                        let (pos_x, pos_y) = match rect.position {
-                                            tauri::Position::Physical(p) => (p.x as f64, p.y as f64),
-                                            tauri::Position::Logical(l) => (l.x, l.y),
-                                        };
-                                        let (size_w, size_h) = match rect.size {
-                                            tauri::Size::Physical(s) => (s.width as f64, s.height as f64),
-                                            tauri::Size::Logical(l) => (l.width, l.height),
-                                        };
-                                        show_window_at_tray(&app, pos_x, pos_y, size_w, size_h);
-                                    }
                                 }
                             }
                         }
@@ -1848,7 +1785,6 @@ pub fn run() {
             get_auth_status,
             logout,
             read_file_bytes,
-            set_blur_hide_enabled,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

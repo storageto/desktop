@@ -689,6 +689,16 @@ function App() {
                     </svg>
                   </button>
                 </Tooltip>
+                <Tooltip text="Close" position="bottom">
+                  <button
+                    onClick={() => getCurrentWindow().hide()}
+                    className="w-8 h-8 flex items-center justify-center rounded-lg hover:bg-[#292524] text-[#57534e] hover:text-[#a8a29e] transition-colors cursor-pointer"
+                  >
+                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                  </button>
+                </Tooltip>
               </>
             )}
           </div>
