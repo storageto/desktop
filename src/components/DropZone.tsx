@@ -28,11 +28,9 @@ export function DropZone({ onFilesSelected, disabled }: DropZoneProps) {
       unlistenDrop = await listen<DragDropPayload>("tauri://drag-drop", (event) => {
         setIsDragOver(false);
 
-        // Debounce: ignore drops within 500ms of each other
+        // Debounce: Tauri fires drag-drop multiple times for a single drop
         const now = Date.now();
-        if (now - lastDropTime.current < 500) {
-          return;
-        }
+        if (now - lastDropTime.current < 500) return;
         lastDropTime.current = now;
 
         if (!disabled && event.payload.paths.length > 0) {
