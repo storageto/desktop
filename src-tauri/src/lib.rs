@@ -1258,6 +1258,44 @@ async fn set_permanent_default_if_premium_first_login(app: &AppHandle, token: &s
     }
 }
 
+/// Handle a `storageto://auth?token=...` deep link: persist the token, focus the
+/// window, notify the frontend, and kick off the first-login premium check.
+///
+/// Shared between the main deep-link plugin listener and the single-instance
+/// callback (Windows passes the URL as argv to the blocked second instance).
+fn handle_auth_url(app: &AppHandle, url: &url::Url) {
+    if url.scheme() != "storageto" || url.host_str() != Some("auth") {
+        return;
+    }
+    let Some(token) = url
+        .query_pairs()
+        .find(|(k, _)| k == "token")
+        .map(|(_, v)| v.into_owned())
+    else {
+        return;
+    };
+
+    eprintln!("[DeepLink] Auth token received");
+
+    {
+        let state: State<AppState> = app.state();
+        let mut config = state.config.lock().unwrap();
+        config.auth_token = Some(token.clone());
+        let _ = save_config(&config);
+    }
+
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+    let _ = app.emit("auth-token-received", ());
+
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        set_permanent_default_if_premium_first_login(&handle, &token).await;
+    });
+}
+
 /// Logout - revoke token on API then clear locally
 #[tauri::command]
 async fn logout(state: State<'_, AppState>) -> Result<(), String> {
@@ -1523,28 +1561,8 @@ pub fn run() {
             // On Windows, deep link URLs are passed as CLI args to the new instance.
             // Since we blocked that instance, process any storageto:// URL ourselves.
             for arg in &argv {
-                if arg.starts_with("storageto://") {
-                    if let Ok(url) = url::Url::parse(arg) {
-                        if url.scheme() == "storageto" && url.host_str() == Some("auth") {
-                            for (key, value) in url.query_pairs() {
-                                if key == "token" {
-                                    eprintln!("[DeepLink] Auth token received via single-instance argv");
-                                    let token = value.to_string();
-                                    let state: tauri::State<AppState> = app.state();
-                                    let mut config = state.config.lock().unwrap();
-                                    config.auth_token = Some(token.clone());
-                                    let _ = save_config(&config);
-                                    drop(config);
-                                    let _ = app.emit("auth-token-received", ());
-
-                                    let first_login_handle = app.clone();
-                                    tauri::async_runtime::spawn(async move {
-                                        set_permanent_default_if_premium_first_login(&first_login_handle, &token).await;
-                                    });
-                                }
-                            }
-                        }
-                    }
+                if let Ok(url) = url::Url::parse(arg) {
+                    handle_auth_url(app, &url);
                 }
             }
         }));
@@ -1689,35 +1707,7 @@ pub fn run() {
                 if let Ok(urls) = serde_json::from_str::<Vec<String>>(urls_str) {
                     for url_str in urls {
                         if let Ok(url) = url::Url::parse(&url_str) {
-                            if url.scheme() == "storageto" && url.host_str() == Some("auth") {
-                                // Extract token from query params
-                                for (key, value) in url.query_pairs() {
-                                    if key == "token" {
-                                        eprintln!("[DeepLink] Auth token received");
-                                        let token = value.to_string();
-
-                                        // Save auth token to config
-                                        let state: State<AppState> = deep_link_handle.state();
-                                        let mut config = state.config.lock().unwrap();
-                                        config.auth_token = Some(token.clone());
-                                        let _ = save_config(&config);
-                                        drop(config);
-
-                                        // Show window and emit event
-                                        if let Some(window) = deep_link_handle.get_webview_window("main") {
-                                            let _ = window.show();
-                                            let _ = window.set_focus();
-                                        }
-                                        let _ = deep_link_handle.emit("auth-token-received", ());
-
-                                        // Auto-set permanent expiry on first login if premium
-                                        let first_login_handle = deep_link_handle.clone();
-                                        tauri::async_runtime::spawn(async move {
-                                            set_permanent_default_if_premium_first_login(&first_login_handle, &token).await;
-                                        });
-                                    }
-                                }
-                            }
+                            handle_auth_url(&deep_link_handle, &url);
                         }
                     }
                 }

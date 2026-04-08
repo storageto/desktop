@@ -360,13 +360,13 @@ export function Settings({ isOpen, onClose, appVersion, addToast }: SettingsProp
                         className={`px-2.5 py-1 rounded-md text-xs font-medium border transition-colors cursor-pointer flex items-center gap-1 ${
                           config.default_expiry_days === 0
                             ? "bg-amber-500/20 text-amber-400 border-amber-500/30"
-                            : authStatus.is_premium
-                              ? "bg-[#1c1917] text-[#a8a29e] border-[#292524] hover:border-[#3f3f46] hover:text-white"
-                              : "bg-[#1c1917] text-[#a8a29e]/50 border-[#292524] hover:border-amber-500/30 hover:text-amber-400/70"
+                            : "bg-[#1c1917] text-amber-500/60 border-amber-500/20 hover:border-amber-500/40 hover:text-amber-400/80"
                         }`}
                       >
-                        <span>No expiry</span>
-                        {!authStatus.is_premium && <span className="text-amber-500/60">★</span>}
+                        <span>No expiry ∞</span>
+                        {!authStatus.is_premium && (
+                          <span className="text-[10px] opacity-70">Premium</span>
+                        )}
                       </button>
                     </div>
                   </div>

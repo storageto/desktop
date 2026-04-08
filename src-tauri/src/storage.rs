@@ -44,6 +44,13 @@ pub struct AppConfig {
     pub show_notifications: bool,
     #[serde(default)]
     pub has_launched: bool,
+    /// Default upload expiry preference.
+    ///
+    /// * `None`          — user hasn't configured a preference; uploads use the server default.
+    /// * `Some(0)`       — permanent (no expiry). Only valid for premium users; set automatically
+    ///                     on first login for premium accounts. Call sites skip the `set_expiry`
+    ///                     request when they see `0` so the backend keeps `expires_at = NULL`.
+    /// * `Some(1..=7)`   — user-chosen expiry in days.
     #[serde(default)]
     pub default_expiry_days: Option<u32>,
     #[serde(default)]
