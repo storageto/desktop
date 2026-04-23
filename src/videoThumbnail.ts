@@ -4,9 +4,13 @@ import { reportError } from "./errorReporter";
 const VIDEO_EXTENSIONS = [".mp4", ".webm", ".mov"];
 const IMAGE_EXTENSIONS = [".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff", ".tif"];
 const THUMBNAIL_TIMEOUT_MS = 8000;
-const THUMBNAIL_MAX_WIDTH = 1280;
+const THUMBNAIL_MAX_WIDTH = 640;
 const THUMBNAIL_JPEG_QUALITY = 0.85;
 const MAX_FILE_SIZE_FOR_THUMBNAIL = 500 * 1024 * 1024; // 500MB
+// Skip thumbnail generation for images that are already tiny — the file
+// itself is a fine preview, and the server falls back to its signed URL.
+const THUMBNAIL_SKIP_MIN_WIDTH = 400;
+const THUMBNAIL_SKIP_MIN_BYTES = 50 * 1024;
 
 /**
  * Check if a file path is a supported video format
@@ -224,7 +228,7 @@ function getImageMimeType(path: string): string {
 /**
  * Extract a thumbnail from a local image file.
  * Reads the file, loads into <img>, scales down via canvas.
- * Skips files < 256KB or images already <= 1280px wide.
+ * Skips tiny images — the file itself is already thumbnail-sized.
  */
 async function extractImageThumbnail(filePath: string): Promise<Blob | null> {
   let fileBytes: Uint8Array;
@@ -235,6 +239,10 @@ async function extractImageThumbnail(filePath: string): Promise<Blob | null> {
     for (let i = 0; i < binary.length; i++) fileBytes[i] = binary.charCodeAt(i);
   } catch (e) {
     reportError({ type: "thumbnail", message: `Image read failed: ${e}`, context: { path: filePath, step: "read_file_bytes" } });
+    return null;
+  }
+
+  if (fileBytes.length < THUMBNAIL_SKIP_MIN_BYTES) {
     return null;
   }
 
@@ -273,6 +281,12 @@ function resizeImage(imageUrl: string): Promise<Blob | null> {
 
     img.addEventListener("load", () => {
       try {
+        if (img.naturalWidth < THUMBNAIL_SKIP_MIN_WIDTH) {
+          clearTimeout(timeout);
+          resolve(null);
+          return;
+        }
+
         const canvas = document.createElement("canvas");
         let width = img.naturalWidth;
         let height = img.naturalHeight;

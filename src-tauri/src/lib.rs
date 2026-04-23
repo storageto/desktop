@@ -955,6 +955,53 @@ fn clear_upload_history() -> Result<(), String> {
     clear_history()
 }
 
+/// Pull the caller's files + collections from the API so the desktop app can
+/// show uploads made from web/CLI. Uses the auth token (cross-device) when
+/// available, otherwise falls back to the visitor_token (this-device only).
+/// Optional `query` narrows the results to filename/title matches server-side.
+#[tauri::command]
+async fn fetch_remote_history(query: Option<String>) -> Result<Vec<UploadHistoryItem>, String> {
+    let api_url = get_api_url();
+    let auth_token = get_auth_token();
+    let visitor_token = get_visitor_token();
+
+    let (url, use_auth) = if auth_token.is_some() {
+        (format!("{}/api/user/files", api_url), true)
+    } else {
+        (format!("{}/api/files", api_url), false)
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("http client: {}", e))?;
+
+    let mut req = client.get(&url).header("Accept", "application/json");
+    if use_auth {
+        if let Some(token) = &auth_token {
+            req = req.header("Authorization", format!("Bearer {}", token));
+        }
+    }
+    if let Some(token) = &visitor_token {
+        req = req.header("X-Visitor-Token", token);
+    }
+    if let Some(q) = query.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+        req = req.query(&[("q", q)]);
+    }
+
+    let resp = req.send().await.map_err(|e| format!("fetch: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("remote history failed ({})", resp.status()));
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Envelope {
+        files: Vec<UploadHistoryItem>,
+    }
+    let body: Envelope = resp.json().await.map_err(|e| format!("parse: {}", e))?;
+    Ok(body.files)
+}
+
 #[tauri::command]
 fn set_history_thumbnail(url: String, thumbnail_url: String) -> Result<(), String> {
     storage::update_history_item_thumbnail(&url, &thumbnail_url)
@@ -1755,6 +1802,7 @@ pub fn run() {
             cancel_upload,
             get_upload_history,
             clear_upload_history,
+            fetch_remote_history,
             set_history_thumbnail,
             delete_uploaded_file,
             set_file_password,

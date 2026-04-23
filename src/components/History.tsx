@@ -50,6 +50,12 @@ interface HistoryProps {
   onSetBurnAfterReading: (fileId: string, isCollection: boolean) => void;
   onRemoveBurnAfterReading: (fileId: string, isCollection: boolean) => void;
   isPremium?: boolean;
+  /** Current search query (parent owns the state so focus-refreshes and
+   *  the debounced fetch share the same source of truth). */
+  searchQuery: string;
+  onSearchQueryChange: (query: string) => void;
+  /** True while the parent has a fetch in flight. */
+  isSearching?: boolean;
 }
 
 interface ModalState {
@@ -644,7 +650,7 @@ function ContextMenu({
   );
 }
 
-export function History({ items, uploads, onDelete, onClearUploads, onSetPassword, onRemovePassword, onSetExpiry, onSetBurnAfterReading, onRemoveBurnAfterReading, isPremium }: HistoryProps) {
+export function History({ items, uploads, onDelete, onClearUploads, onSetPassword, onRemovePassword, onSetExpiry, onSetBurnAfterReading, onRemoveBurnAfterReading, isPremium, searchQuery, onSearchQueryChange, isSearching }: HistoryProps) {
   const [, setTick] = useState(0);
   useEffect(() => {
     const interval = setInterval(() => setTick(t => t + 1), 60_000);
@@ -658,7 +664,6 @@ export function History({ items, uploads, onDelete, onClearUploads, onSetPasswor
   const menuButtonRefs = useRef<Map<string, HTMLButtonElement | null>>(new Map());
   const [modal, setModal] = useState<ModalState | null>(null);
   const [password, setPassword] = useState("");
-  const [searchQuery, setSearchQuery] = useState("");
   const [isSearchOpen, setIsSearchOpen] = useState(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
 
@@ -783,17 +788,8 @@ export function History({ items, uploads, onDelete, onClearUploads, onSetPasswor
   const activeCollectionGroups = collectionGroups;
   const activeStandaloneUploads = standaloneUploads;
 
-  // Filter items by search query
-  const filteredItems = searchQuery.trim()
-    ? items.filter(item => {
-        const query = searchQuery.toLowerCase();
-        // Match item filename
-        if (item.filename.toLowerCase().includes(query)) return true;
-        // Match collection file names
-        if (item.files?.some(f => f.filename.toLowerCase().includes(query))) return true;
-        return false;
-      })
-    : items;
+  // Server is authoritative — `items` is already filtered when there's a
+  // query, so we render verbatim with no extra client-side filter.
 
   const openSearch = () => {
     setIsSearchOpen(true);
@@ -801,11 +797,15 @@ export function History({ items, uploads, onDelete, onClearUploads, onSetPasswor
   };
 
   const closeSearch = () => {
+    searchInputRef.current?.blur();
     setIsSearchOpen(false);
-    setSearchQuery("");
+    onSearchQueryChange("");
   };
 
-  if (!hasContent) {
+  // Only show the empty splash when we're genuinely empty — not searching,
+  // no pending fetch, no active query. Otherwise the user sees a flicker of
+  // "No recent uploads" during transitions (mount, clearing search, etc).
+  if (!hasContent && !isSearchOpen && !searchQuery && !isSearching) {
     return (
       <div className="flex-1 flex flex-col items-center justify-center px-4 py-8">
         <div className="w-12 h-12 rounded-full bg-[#1c1917] flex items-center justify-center mb-3">
@@ -832,11 +832,17 @@ export function History({ items, uploads, onDelete, onClearUploads, onSetPasswor
                 ref={searchInputRef}
                 type="text"
                 value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
+                onChange={(e) => onSearchQueryChange(e.target.value)}
                 onKeyDown={(e) => e.key === "Escape" && closeSearch()}
                 placeholder="Search files..."
-                className="w-full pl-7 pr-2 py-1 text-xs text-white bg-[#1c1917] border border-[#292524] rounded focus:outline-none focus:border-[#57534e] placeholder:text-[#57534e]"
+                className="w-full pl-7 pr-7 py-1 text-xs text-white bg-[#1c1917] border border-[#292524] rounded focus:outline-none focus:border-[#57534e] placeholder:text-[#57534e]"
               />
+              {isSearching && (
+                <svg className="absolute right-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 animate-spin text-amber-500" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" />
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                </svg>
+              )}
             </div>
             <button
               onClick={closeSearch}
@@ -953,12 +959,12 @@ export function History({ items, uploads, onDelete, onClearUploads, onSetPasswor
           ))}
 
           {/* Completed history items */}
-          {searchQuery && filteredItems.length === 0 && (
+          {searchQuery.trim() && items.length === 0 && !isSearching && (
             <div className="py-6 text-center">
               <p className="text-sm text-[#57534e]">No files matching "{searchQuery}"</p>
             </div>
           )}
-          {filteredItems.map((item) => {
+          {items.map((item) => {
             const isExpanded = expandedCollections.has(item.id);
             const hasFiles = item.is_collection && item.files && item.files.length > 0;
             const menuKey = `item-${item.id}`;

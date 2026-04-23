@@ -28,6 +28,30 @@ html, body, #root {
   height: 100%;
 }
 
+/* WebKit on macOS sometimes pins the I-beam cursor after a text input is
+ * focused and doesn't re-evaluate per-element cursor CSS until the mouse
+ * leaves the window. Forcing every element to explicitly inherit (then
+ * overriding for inputs/buttons) keeps the cursor context in sync. */
+* {
+  cursor: inherit;
+}
+
+html, body, #root {
+  cursor: default;
+}
+
+input, textarea, [contenteditable="true"] {
+  cursor: text;
+}
+
+button, a, [role="button"], label, select, summary {
+  cursor: pointer;
+}
+
+button:disabled, [aria-disabled="true"] {
+  cursor: not-allowed;
+}
+
 body {
   font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   -webkit-font-smoothing: antialiased;

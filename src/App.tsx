@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
@@ -72,6 +72,20 @@ function parseErrorMessage(rawError: string): string {
 function App() {
   const [uploads, setUploads] = useState<UploadItem[]>([]);
   const [history, setHistory] = useState<HistoryItem[]>([]);
+  // Monotonic counter so out-of-order server responses (e.g. slow q="a"
+  // landing after fast q="ab") can be ignored — we only apply a result if
+  // its sequence number is still the most recent request we issued.
+  const fetchSeqRef = useRef(0);
+  // Parent owns the search box so focus-refreshes, debounced search, and the
+  // initial load all flow through a single fetcher.
+  const [searchQuery, setSearchQuery] = useState("");
+  const [isSearching, setIsSearching] = useState(false);
+  // Cached last "no-query" list so clearing the search restores the full list
+  // instantly instead of flashing an empty state while the network catches up.
+  const fullListRef = useRef<HistoryItem[]>([]);
+  // True once we've got at least one successful server response, so we don't
+  // flash the "No recent uploads" splash before the first fetch has returned.
+  const hasLoadedRef = useRef(false);
   const [appVersion, setAppVersion] = useState<string | null>(null);
   const [updateReady, setUpdateReady] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -94,14 +108,56 @@ function App() {
     setUploads([]);
   }, []);
 
+  // Unified fetcher. Honours whatever's currently in the search box, ignores
+  // out-of-order responses, and leaves state untouched on failure so offline
+  // users keep seeing their last good list.
+  const fetchHistory = useCallback(async (query: string | null) => {
+    const seq = ++fetchSeqRef.current;
+    setIsSearching(true);
+    try {
+      const items = await invoke<HistoryItem[]>("fetch_remote_history", { query });
+      if (seq !== fetchSeqRef.current) return;
+      if (!query) fullListRef.current = items;
+      setHistory(items);
+      hasLoadedRef.current = true;
+    } catch (err) {
+      if (seq === fetchSeqRef.current) console.warn("history fetch failed:", err);
+    } finally {
+      if (seq === fetchSeqRef.current) setIsSearching(false);
+    }
+  }, []);
+
+  // First paint: show local cache instantly, then swap in server truth.
+  // After the first successful fetch the local cache is never shown again.
+  const hydrateFromLocalCache = useCallback(async () => {
+    try {
+      const items = await invoke<HistoryItem[]>("get_upload_history");
+      const now = Date.now();
+      const cutoff = 24 * 60 * 60 * 1000;
+      const valid = items.filter((item) => {
+        if (!item.expires_at) return true;
+        return now - new Date(item.expires_at).getTime() < cutoff;
+      });
+      if (valid.length < items.length) {
+        for (const it of items) {
+          if (!valid.includes(it)) await invoke("remove_from_history", { url: it.url }).catch(() => {});
+        }
+      }
+      setHistory((prev) => (prev.length ? prev : valid));
+    } catch (err) {
+      console.warn("local history load failed:", err);
+    }
+  }, []);
+
   // Load history and version on mount
   useEffect(() => {
-    loadHistory();
+    hydrateFromLocalCache();
+    fetchHistory(null);
     getVersion().then(setAppVersion).catch(() => {});
     invoke<{ logged_in: boolean; is_premium?: boolean }>("get_auth_status")
       .then((s) => setIsPremium(s.logged_in && (s.is_premium ?? false)))
       .catch(() => {});
-  }, []);
+  }, [hydrateFromLocalCache, fetchHistory]);
 
   // Listen for update-ready event from Rust
   useEffect(() => {
@@ -136,6 +192,28 @@ function App() {
     };
   }, []);
 
+  // Refresh history when the window gains focus (user reopened the menu bar
+  // panel) so web/CLI uploads made while it was hidden show up. Respects the
+  // current search so focus doesn't clobber filtered results.
+  useEffect(() => {
+    const onFocus = () => { fetchHistory(searchQuery.trim() || null); };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [fetchHistory, searchQuery]);
+
+  // Debounced search: whenever the user pauses typing, fetch with the current
+  // query (or null to restore the full list). Clearing the query does an
+  // instant restore from the cached full list so the panel doesn't flash
+  // the empty splash while the re-fetch is in flight.
+  useEffect(() => {
+    const q = searchQuery.trim();
+    if (!q && fullListRef.current.length) {
+      setHistory(fullListRef.current);
+    }
+    const timer = setTimeout(() => fetchHistory(q || null), 250);
+    return () => clearTimeout(timer);
+  }, [searchQuery, fetchHistory]);
+
   // Handle restart to apply update
   const handleRestartForUpdate = useCallback(async () => {
     try {
@@ -167,39 +245,6 @@ function App() {
     requestNotificationPermission();
   }, []);
 
-  const loadHistory = async () => {
-    try {
-      const items = await invoke<HistoryItem[]>("get_upload_history");
-
-      // Filter out items that expired more than 24 hours ago
-      const now = new Date();
-      const twentyFourHoursMs = 24 * 60 * 60 * 1000;
-
-      const validItems = items.filter(item => {
-        if (!item.expires_at) return true; // No expiry = keep
-        const expiryDate = new Date(item.expires_at);
-        const expiredForMs = now.getTime() - expiryDate.getTime();
-        // Keep if not expired yet, or expired less than 24 hours ago
-        return expiredForMs < twentyFourHoursMs;
-      });
-
-      // If we filtered any items, persist the cleanup
-      if (validItems.length < items.length) {
-        const removedUrls = items
-          .filter(item => !validItems.includes(item))
-          .map(item => item.url);
-
-        // Remove from persistent storage
-        for (const url of removedUrls) {
-          await invoke("remove_from_history", { url }).catch(() => {});
-        }
-      }
-
-      setHistory(validItems);
-    } catch (err) {
-      console.error("Failed to load history:", err);
-    }
-  };
 
   const showNotification = async (title: string, body: string) => {
     try {
@@ -271,7 +316,7 @@ function App() {
           });
 
           // Refresh history first, then clear uploads so file doesn't vanish
-          await loadHistory();
+          await fetchHistory(searchQuery.trim() || null);
           setUploads([]);
           return;
         } catch {
@@ -323,7 +368,7 @@ function App() {
         }
 
         // Refresh history (icons already saved, so thumbnails show immediately)
-        await loadHistory();
+        await fetchHistory(searchQuery.trim() || null);
         setUploads([]);
 
         // Upload full thumbnails to API in background (slow, fire-and-forget)
@@ -394,7 +439,7 @@ function App() {
       const thumbnailBlobs = await generateThumbnailIcons([screenshotPath], [result.url]).catch(() => new Map<string, Blob>());
 
       // Refresh history first, then clear uploads so file doesn't vanish
-      await loadHistory();
+      await fetchHistory(searchQuery.trim() || null);
       setUploads([]);
 
       if (thumbnailBlobs.size > 0) {
@@ -719,6 +764,9 @@ function App() {
           onSetBurnAfterReading={handleSetBurnAfterReading}
           onRemoveBurnAfterReading={handleRemoveBurnAfterReading}
           isPremium={isPremium}
+          searchQuery={searchQuery}
+          onSearchQueryChange={setSearchQuery}
+          isSearching={isSearching}
         />
 
         {/* Settings panel (slides over content) */}
