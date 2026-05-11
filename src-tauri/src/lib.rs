@@ -1001,11 +1001,6 @@ async fn fetch_remote_history(query: Option<String>) -> Result<Vec<UploadHistory
 }
 
 #[tauri::command]
-fn set_history_thumbnail(url: String, thumbnail_url: String) -> Result<(), String> {
-    storage::update_history_item_thumbnail(&url, &thumbnail_url)
-}
-
-#[tauri::command]
 async fn delete_uploaded_file(file_id: String, url: String, is_collection: bool) -> Result<(), String> {
     // Delete from storage.to API
     delete_file(file_id, is_collection).await?;
@@ -1366,12 +1361,6 @@ async fn logout(state: State<'_, AppState>) -> Result<(), String> {
     let mut config = state.config.lock().unwrap();
     config.auth_token = None;
     save_config(&config)
-}
-
-#[tauri::command]
-async fn read_file_bytes(path: String) -> Result<String, String> {
-    let bytes = tokio::fs::read(&path).await.map_err(|e| format!("Failed to read {}: {}", path, e))?;
-    Ok(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes))
 }
 
 /// Send analytics event to API
@@ -1801,7 +1790,6 @@ pub fn run() {
             get_upload_history,
             clear_upload_history,
             fetch_remote_history,
-            set_history_thumbnail,
             delete_uploaded_file,
             set_file_password,
             set_file_expiry,
@@ -1820,7 +1808,6 @@ pub fn run() {
             update_screenshot_shortcut,
             get_auth_status,
             logout,
-            read_file_bytes,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

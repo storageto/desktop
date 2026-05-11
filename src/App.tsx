@@ -12,7 +12,6 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getVersion } from "@tauri-apps/api/app";
 import { reportError } from "./errorReporter";
 import { trackUploadComplete, trackScreenshotComplete } from "./analyticsReporter";
-import { generateThumbnailIcons, uploadThumbnails } from "./videoThumbnail";
 
 interface UploadProgress {
   file_id: string;
@@ -357,24 +356,9 @@ function App() {
           isCollection: lastResult.is_collection,
         });
 
-        // Generate thumbnail icons locally (fast) before loading history
-        const fileUrls = fileResults.map(r => r.url);
-        let thumbnailBlobs = new Map<string, Blob>();
-        if (fileUrls.length > 0) {
-          thumbnailBlobs = await generateThumbnailIcons(paths, fileUrls).catch((e) => {
-            reportError({ type: "thumbnail", message: `generateThumbnailIcons crashed: ${e}`, stack: e instanceof Error ? e.stack : undefined, context: { step: "app_catch", fileCount: paths.length } });
-            return new Map();
-          });
-        }
-
-        // Refresh history (icons already saved, so thumbnails show immediately)
+        // Refresh history — server generates thumbnails async, will appear on next focus
         await fetchHistory(searchQuery.trim() || null);
         setUploads([]);
-
-        // Upload full thumbnails to API in background (slow, fire-and-forget)
-        if (thumbnailBlobs.size > 0) {
-          uploadThumbnails(thumbnailBlobs).catch(() => {});
-        }
       }
     } catch (err) {
       console.error("Upload failed:", err);
@@ -435,16 +419,9 @@ function App() {
       // Track analytics
       trackScreenshotComplete();
 
-      // Generate and upload thumbnail (same as regular image uploads)
-      const thumbnailBlobs = await generateThumbnailIcons([screenshotPath], [result.url]).catch(() => new Map<string, Blob>());
-
-      // Refresh history first, then clear uploads so file doesn't vanish
+      // Refresh history — server generates thumbnails async, will appear on next focus
       await fetchHistory(searchQuery.trim() || null);
       setUploads([]);
-
-      if (thumbnailBlobs.size > 0) {
-        uploadThumbnails(thumbnailBlobs).catch(() => {});
-      }
     } catch (err) {
       console.error("[Screenshot] Error:", err);
       const rawError = String(err);

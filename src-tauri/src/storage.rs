@@ -201,19 +201,6 @@ pub fn check_first_launch() -> bool {
     false
 }
 
-pub fn update_history_item_thumbnail(url: &str, thumbnail_url: &str) -> Result<(), String> {
-    let mut config = load_config();
-
-    for item in &mut config.upload_history {
-        if item.url == url {
-            item.thumbnail_url = Some(thumbnail_url.to_string());
-            break;
-        }
-    }
-
-    save_config(&config)
-}
-
 pub fn update_history_item_protection(
     url: &str,
     password_protected: Option<bool>,
