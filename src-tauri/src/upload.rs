@@ -4,8 +4,7 @@ use reqwest::header::{HeaderMap, HeaderValue, CONTENT_LENGTH, CONTENT_TYPE};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
-use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::Path;
 use tauri::ipc::Channel;
 use uuid::Uuid;
@@ -119,8 +118,6 @@ struct ConfirmUploadRequest {
     content_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     collection_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    crc32: Option<u64>,
 }
 
 // Batch upload structs
@@ -165,8 +162,6 @@ pub struct BatchConfirmFile {
     pub size: u64,
     pub content_type: String,
     pub r2_key: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub crc32: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -368,7 +363,7 @@ pub async fn upload_to_r2(
     on_progress: &Channel<UploadProgress>,
     collection_id: Option<String>,
     collection_name: Option<String>,
-) -> Result<u32, String> {
+) -> Result<(), String> {
     upload_single(get_client(), upload_url, path, size, file_id, filename, on_progress, collection_id, collection_name).await
 }
 
@@ -384,7 +379,7 @@ pub async fn upload_multipart_to_r2(
     on_progress: &Channel<UploadProgress>,
     collection_id: Option<String>,
     collection_name: Option<String>,
-) -> Result<u32, String> {
+) -> Result<(), String> {
     upload_multipart_v2(
         get_client(),
         &get_api_url(),
@@ -405,18 +400,6 @@ pub async fn upload_multipart_to_r2(
 /// Get the BATCH_SIZE constant for external use
 pub fn get_batch_size() -> usize {
     BATCH_SIZE
-}
-
-fn compute_crc32(path: &Path) -> Result<u32, String> {
-    let mut file = File::open(path).map_err(|e| format!("Failed to open file for CRC: {}", e))?;
-    let mut hasher = crc32fast::Hasher::new();
-    let mut buffer = [0u8; 65536];
-    loop {
-        let n = file.read(&mut buffer).map_err(|e| format!("CRC read error: {}", e))?;
-        if n == 0 { break; }
-        hasher.update(&buffer[..n]);
-    }
-    Ok(hasher.finalize())
 }
 
 pub async fn upload_file(
@@ -517,7 +500,7 @@ pub async fn upload_file(
         collection_name: None,
     });
 
-    let file_crc = if upload_type == "multipart" {
+    if upload_type == "multipart" {
         // Multipart upload for large files
         let upload_id = init_data.upload_id.ok_or("No upload_id for multipart upload")?;
         let initial_urls = init_data.initial_urls.unwrap_or_default();
@@ -536,12 +519,12 @@ pub async fn upload_file(
             None,
             None,
         )
-        .await?
+        .await?;
     } else {
         // Single upload
         let upload_url = init_data.upload_url.ok_or("No upload_url in response")?;
-        upload_single(&client, &upload_url, path, size, &file_id, &filename, &on_progress, None, None).await?
-    };
+        upload_single(&client, &upload_url, path, size, &file_id, &filename, &on_progress, None, None).await?;
+    }
 
     // Step 3: Confirm upload
     let _ = on_progress.send(UploadProgress {
@@ -561,7 +544,6 @@ pub async fn upload_file(
         size,
         content_type,
         collection_id: collection_id.clone(),
-        crc32: Some(file_crc as u64),
     };
 
     let confirm_response = client
@@ -645,7 +627,7 @@ async fn upload_single(
     on_progress: &Channel<UploadProgress>,
     collection_id: Option<String>,
     collection_name: Option<String>,
-) -> Result<u32, String> {
+) -> Result<(), String> {
     use tokio::io::AsyncReadExt;
 
     let content_type = get_content_type(path);
@@ -726,7 +708,7 @@ async fn upload_single(
         return Err(format!("Upload failed: {}", error_text));
     }
 
-    compute_crc32(path)
+    Ok(())
 }
 
 async fn upload_multipart_v2(
@@ -742,7 +724,7 @@ async fn upload_multipart_v2(
     on_progress: &Channel<UploadProgress>,
     collection_id: Option<String>,
     collection_name: Option<String>,
-) -> Result<u32, String> {
+) -> Result<(), String> {
     use std::sync::atomic::AtomicU64;
     use tokio::io::AsyncReadExt;
 
@@ -867,7 +849,7 @@ async fn upload_multipart_v2(
             continue;
         }
 
-        return compute_crc32(path);
+        return Ok(());
     }
 
     Err(last_error)
