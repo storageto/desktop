@@ -634,6 +634,8 @@ function App() {
   };
 
   const isWindows = navigator.userAgent.includes("Windows");
+  // Screenshot capture isn't implemented on Linux yet (beta build)
+  const isLinux = navigator.userAgent.includes("Linux");
 
   return (
     <div className="flex flex-col h-screen">
@@ -700,6 +702,7 @@ function App() {
                     </svg>
                   </button>
                 </Tooltip>
+                {!isLinux && (
                 <Tooltip text="Screenshot" position="bottom">
                   <button
                     onClick={handleScreenshot}
@@ -711,6 +714,7 @@ function App() {
                     </svg>
                   </button>
                 </Tooltip>
+                )}
                 <Tooltip text="Close" position="bottom">
                   <button
                     onClick={() => getCurrentWindow().hide()}

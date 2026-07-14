@@ -1425,6 +1425,7 @@ fn start_heartbeat_task() {
 }
 
 /// Start the background update checker task
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn start_update_checker(app_handle: AppHandle) {
     use tauri_plugin_updater::UpdaterExt;
     use tauri_plugin_notification::NotificationExt;
@@ -1754,9 +1755,14 @@ pub fn run() {
             start_heartbeat_task();
             eprintln!("[Analytics] Background heartbeat started");
 
-            // Start background update checker
-            start_update_checker(app.handle().clone());
-            eprintln!("[Updater] Background update checker started");
+            // Start background update checker.
+            // Linux is an experimental beta build with no signed updater pipeline,
+            // so auto-update is disabled there until it's properly tested.
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            {
+                start_update_checker(app.handle().clone());
+                eprintln!("[Updater] Background update checker started");
+            }
 
             // Re-emit pending update on startup (in case user ignored the notification last session)
             {

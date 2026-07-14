@@ -229,6 +229,8 @@ export function Settings({ isOpen, onClose, appVersion, addToast }: SettingsProp
 
   const currentShortcut = config?.screenshot_shortcut || getDefaultShortcut();
   const shortcutKeys = parseShortcutToKeys(currentShortcut);
+  // Screenshot capture isn't implemented on Linux yet (beta build)
+  const isLinux = navigator.userAgent.includes("Linux");
 
   return (
     <div
@@ -372,6 +374,7 @@ export function Settings({ isOpen, onClose, appVersion, addToast }: SettingsProp
                   </div>
 
                   {/* Screenshot shortcut */}
+                  {!isLinux && (
                   <div>
                     <div className="flex items-center justify-between mb-2">
                       <span className="text-sm text-[#e7e5e4]">Screenshot shortcut</span>
@@ -422,6 +425,7 @@ export function Settings({ isOpen, onClose, appVersion, addToast }: SettingsProp
                       </div>
                     )}
                   </div>
+                  )}
                 </div>
               </div>
 
