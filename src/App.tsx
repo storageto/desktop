@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { sendNotification, isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 import { DropZone } from "./components/DropZone";
-import { History, HistoryItem, UploadItem } from "./components/History";
+import { History, HistoryItem, UploadItem, QrModal } from "./components/History";
 import { Settings } from "./components/Settings";
 import { ToastContainer, useToast } from "./components/Toast";
 import { Tooltip } from "./components/Tooltip";
@@ -89,6 +89,8 @@ function App() {
   const [updateReady, setUpdateReady] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [isPremium, setIsPremium] = useState(false);
+  // Auto-show-on-complete QR modal (opt-in setting). Null when hidden.
+  const [qrModal, setQrModal] = useState<{ url: string; filename: string } | null>(null);
   const { toasts, addToast, dismissToast } = useToast();
 
   // Derived: are there active uploads in progress?
@@ -264,6 +266,21 @@ function App() {
     }
   };
 
+  // When the "Show QR code on upload complete" setting is on, pop the QR modal
+  // front-and-center the instant an upload finishes so the user can scan it on
+  // their phone. Reads the setting fresh each time so a toggle mid-session is
+  // respected without extra wiring.
+  const maybeShowQrOnComplete = async (url: string, filename: string) => {
+    try {
+      const cfg = await invoke<{ show_qr_on_complete: boolean }>("get_config");
+      if (cfg.show_qr_on_complete) {
+        setQrModal({ url, filename });
+      }
+    } catch (err) {
+      console.error("Failed to read QR-on-complete setting:", err);
+    }
+  };
+
   const handleProgress = useCallback((progress: UploadProgress) => {
     setUploads((prev) => {
       const item: UploadItem = {
@@ -317,6 +334,7 @@ function App() {
           // Refresh history first, then clear uploads so file doesn't vanish
           await fetchHistory(searchQuery.trim() || null);
           setUploads([]);
+          await maybeShowQrOnComplete(result.url, result.filename);
           return;
         } catch {
           // Not a folder, continue with file upload
@@ -359,6 +377,7 @@ function App() {
         // Refresh history — server generates thumbnails async, will appear on next focus
         await fetchHistory(searchQuery.trim() || null);
         setUploads([]);
+        await maybeShowQrOnComplete(lastResult.url, lastResult.filename);
       }
     } catch (err) {
       console.error("Upload failed:", err);
@@ -422,6 +441,7 @@ function App() {
       // Refresh history — server generates thumbnails async, will appear on next focus
       await fetchHistory(searchQuery.trim() || null);
       setUploads([]);
+      await maybeShowQrOnComplete(result.url, result.filename);
     } catch (err) {
       console.error("[Screenshot] Error:", err);
       const rawError = String(err);
@@ -753,6 +773,11 @@ function App() {
           appVersion={appVersion}
           addToast={addToast}
         />
+
+        {/* Auto-shown QR code (on upload complete, when the setting is on) */}
+        {qrModal && (
+          <QrModal url={qrModal.url} filename={qrModal.filename} onClose={() => setQrModal(null)} />
+        )}
 
         {/* In-app toast notifications */}
         <ToastContainer toasts={toasts} onDismiss={dismissToast} />

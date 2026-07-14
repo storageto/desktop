@@ -59,6 +59,10 @@ pub struct AppConfig {
     pub auth_token: Option<String>,
     #[serde(default)]
     pub pending_update_version: Option<String>,
+    /// Auto-show a QR code modal the moment an upload completes. Off by default —
+    /// only users who do the laptop→phone flow opt in.
+    #[serde(default)]
+    pub show_qr_on_complete: bool,
 }
 
 impl AppConfig {
@@ -74,6 +78,7 @@ impl AppConfig {
             screenshot_shortcut: None,
             auth_token: None,
             pending_update_version: None,
+            show_qr_on_complete: false,
         }
     }
 }

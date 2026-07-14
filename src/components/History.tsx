@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useMemo, type ReactElement } from "react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useFloating, offset, flip, shift, autoUpdate, FloatingPortal } from "@floating-ui/react";
+import { QRCodeSVG } from "qrcode.react";
 import { Tooltip } from "./Tooltip";
 
 export interface CollectionFile {
@@ -59,10 +60,50 @@ interface HistoryProps {
 }
 
 interface ModalState {
-  type: "password" | "expiry";
+  type: "password" | "expiry" | "qr";
   fileId: string;
   isCollection: boolean;
   filename: string;
+  /** Share URL to encode — only set for the "qr" modal. */
+  url?: string;
+}
+
+/**
+ * QR code modal. The share URL is encoded entirely client-side/offline by
+ * `qrcode.react` (no network, no backend). Shared out of this module so App can
+ * reuse the exact same modal for the auto-show-on-upload-complete setting.
+ */
+export function QrModal({ url, filename, onClose }: { url: string; filename: string; onClose: () => void }) {
+  return (
+    <div className="absolute inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
+      <div className="bg-[#1c1917] border border-[#292524] rounded-xl p-5 max-w-[300px] w-full shadow-xl">
+        <div className="flex items-center gap-3 mb-4">
+          <div className="w-10 h-10 rounded-lg bg-[#292524] flex items-center justify-center flex-shrink-0">
+            <svg className="w-5 h-5 text-[#f472b6]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v1m6 11h2m-6 0h-2v4m0-11v3m0 0h.01M12 12h4.01M16 20h4M4 12h4m12 0h.01M5 8h2a1 1 0 001-1V5a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1zm12 0h2a1 1 0 001-1V5a1 1 0 00-1-1h-2a1 1 0 00-1 1v2a1 1 0 001 1zM5 20h2a1 1 0 001-1v-2a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1z" />
+            </svg>
+          </div>
+          <div className="min-w-0">
+            <h4 className="text-base font-semibold text-white">Scan QR code</h4>
+            <p className="text-xs text-[#57534e] truncate max-w-[180px]">{filename}</p>
+          </div>
+        </div>
+        {/* White quiet-zone background so cameras can lock on regardless of theme */}
+        <div className="flex justify-center mb-4">
+          <div className="bg-white p-3 rounded-lg">
+            <QRCodeSVG value={url} size={196} level="M" />
+          </div>
+        </div>
+        <p className="text-[11px] text-center text-[#57534e] mb-4 break-all">{url}</p>
+        <button
+          onClick={onClose}
+          className="w-full px-4 py-2 text-sm font-medium text-[#a8a29e] bg-[#1c1917] border border-[#292524] hover:bg-[#292524] rounded-lg transition-colors cursor-pointer"
+        >
+          Close
+        </button>
+      </div>
+    </div>
+  );
 }
 
 function formatBytes(bytes: number): string {
@@ -514,6 +555,7 @@ function ContextMenu({
   onClose,
   onCopy,
   onOpen,
+  onQr,
   onDelete,
   onPassword,
   onExpiry,
@@ -527,6 +569,7 @@ function ContextMenu({
   onClose: () => void;
   onCopy: () => void;
   onOpen: () => void;
+  onQr?: () => void;
   onDelete?: () => void;
   onPassword?: () => void;
   onExpiry?: () => void;
@@ -595,6 +638,15 @@ function ContextMenu({
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
         </svg>
         Open in browser
+      </button>
+      <button
+        onClick={() => { onQr?.(); onClose(); }}
+        className="w-full px-3 py-2 text-left text-xs text-[#a8a29e] hover:bg-[#292524] hover:text-white flex items-center gap-2 transition-colors cursor-pointer"
+      >
+        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v1m6 11h2m-6 0h-2v4m0-11v3m0 0h.01M12 12h4.01M16 20h4M4 12h4m12 0h.01M5 8h2a1 1 0 001-1V5a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1zm12 0h2a1 1 0 001-1V5a1 1 0 00-1-1h-2a1 1 0 00-1 1v2a1 1 0 001 1zM5 20h2a1 1 0 001-1v-2a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1z" />
+        </svg>
+        Show QR code
       </button>
 
       {/* Separator */}
@@ -802,6 +854,17 @@ export function History({ items, uploads, onDelete, onClearUploads, onSetPasswor
       fileId,
       isCollection,
       filename: item.filename
+    });
+  };
+
+  const openQrModal = (item: HistoryItem | CollectionFile, isCollection: boolean) => {
+    const fileId = getFileIdFromUrl(item.url);
+    setModal({
+      type: "qr",
+      fileId,
+      isCollection,
+      filename: item.filename,
+      url: item.url,
     });
   };
 
@@ -1165,6 +1228,7 @@ export function History({ items, uploads, onDelete, onClearUploads, onSetPasswor
                     onClose={() => setOpenMenu(null)}
                     onCopy={() => handleCopy(item.url)}
                     onOpen={() => handleOpen(item.url)}
+                    onQr={() => openQrModal(item, item.is_collection)}
                     onDelete={() => handleDeleteClick(item)}
                     onPassword={() => handlePasswordToggle(item, item.is_collection)}
                     onExpiry={() => openExpiryModal(item, item.is_collection)}
@@ -1220,6 +1284,7 @@ export function History({ items, uploads, onDelete, onClearUploads, onSetPasswor
                             onClose={() => setOpenMenu(null)}
                             onCopy={() => handleCopy(file.url)}
                             onOpen={() => handleOpen(file.url)}
+                            onQr={() => openQrModal(file, false)}
                             onPassword={() => openPasswordModal(file, false)}
                             onExpiry={() => openExpiryModal(file, false)}
                             onBurn={() => onSetBurnAfterReading(getFileIdFromUrl(file.url), false)}
@@ -1262,6 +1327,11 @@ export function History({ items, uploads, onDelete, onClearUploads, onSetPasswor
             </div>
           </div>
         </div>
+      )}
+
+      {/* QR code modal */}
+      {modal?.type === "qr" && modal.url && (
+        <QrModal url={modal.url} filename={modal.filename} onClose={() => setModal(null)} />
       )}
 
       {/* Password modal */}

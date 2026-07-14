@@ -13,6 +13,7 @@ interface AppConfig {
   default_expiry_days: number | null;
   screenshot_shortcut: string | null;
   auth_token: string | null;
+  show_qr_on_complete: boolean;
 }
 
 interface SettingsProps {
@@ -313,6 +314,15 @@ export function Settings({ isOpen, onClose, appVersion, addToast }: SettingsProp
                     <Toggle
                       checked={config.auto_copy_url}
                       onChange={(val) => updateConfig({ auto_copy_url: val })}
+                    />
+                  </div>
+
+                  {/* Show QR code on upload complete */}
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm text-[#e7e5e4]">Show QR code on upload complete</span>
+                    <Toggle
+                      checked={config.show_qr_on_complete}
+                      onChange={(val) => updateConfig({ show_qr_on_complete: val })}
                     />
                   </div>
 
