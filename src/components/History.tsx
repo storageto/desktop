@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, type ReactElement } from "react";
+import { useState, useRef, useEffect, useMemo, type ReactElement } from "react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useFloating, offset, flip, shift, autoUpdate, FloatingPortal } from "@floating-ui/react";
@@ -650,6 +650,33 @@ function ContextMenu({
   );
 }
 
+type SortKey = "created" | "size" | "expiry";
+type SortDir = "asc" | "desc";
+
+const SORT_OPTIONS: { key: SortKey; label: string }[] = [
+  { key: "created", label: "Date added" },
+  { key: "size", label: "Size" },
+  { key: "expiry", label: "Expiry" },
+];
+
+/** Compare two history items by the chosen key + direction. Items with no
+ *  expiry always sort to the bottom regardless of direction (there's nothing
+ *  to compare), so their pin is applied before the direction multiplier. */
+function compareItems(a: HistoryItem, b: HistoryItem, key: SortKey, dir: SortDir): number {
+  const mul = dir === "asc" ? 1 : -1;
+  if (key === "size") return (a.size - b.size) * mul;
+  if (key === "created") {
+    return (new Date(a.uploaded_at).getTime() - new Date(b.uploaded_at).getTime()) * mul;
+  }
+  // expiry — items with no expiry stay pinned last in BOTH directions
+  const ax = a.expires_at ? new Date(a.expires_at).getTime() : null;
+  const bx = b.expires_at ? new Date(b.expires_at).getTime() : null;
+  if (ax === null && bx === null) return 0;
+  if (ax === null) return 1;
+  if (bx === null) return -1;
+  return (ax - bx) * mul;
+}
+
 export function History({ items, uploads, onDelete, onClearUploads, onSetPassword, onRemovePassword, onSetExpiry, onSetBurnAfterReading, onRemoveBurnAfterReading, isPremium, searchQuery, onSearchQueryChange, isSearching }: HistoryProps) {
   const [, setTick] = useState(0);
   useEffect(() => {
@@ -666,6 +693,39 @@ export function History({ items, uploads, onDelete, onClearUploads, onSetPasswor
   const [password, setPassword] = useState("");
   const [isSearchOpen, setIsSearchOpen] = useState(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const [sortKey, setSortKey] = useState<SortKey>("created");
+  const [sortDir, setSortDir] = useState<SortDir>("desc");
+  const [isSortOpen, setIsSortOpen] = useState(false);
+  const sortMenuRef = useRef<HTMLDivElement>(null);
+
+  // Sort the completed history items client-side. Search stays server-driven
+  // (`items` is already the filtered set), so this only reorders what's shown.
+  const sortedItems = useMemo(
+    () => [...items].sort((a, b) => compareItems(a, b, sortKey, sortDir)),
+    [items, sortKey, sortDir],
+  );
+
+  // Close the sort menu on an outside click.
+  useEffect(() => {
+    if (!isSortOpen) return;
+    const handler = (e: MouseEvent) => {
+      if (sortMenuRef.current && !sortMenuRef.current.contains(e.target as Node)) {
+        setIsSortOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [isSortOpen]);
+
+  // Picking a key selects it (default desc); picking the active key flips direction.
+  const chooseSort = (key: SortKey) => {
+    if (key === sortKey) {
+      setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+    } else {
+      setSortKey(key);
+      setSortDir("desc");
+    }
+  };
 
   const toggleExpanded = (id: string) => {
     setExpandedCollections(prev => {
@@ -865,6 +925,45 @@ export function History({ items, uploads, onDelete, onClearUploads, onSetPasswor
             </h3>
             <div className="flex items-center gap-2">
               {items.length > 0 && activeUploads.length === 0 && (
+                <div className="relative" ref={sortMenuRef}>
+                  <Tooltip text="Sort uploads">
+                    <button
+                      onClick={() => setIsSortOpen((o) => !o)}
+                      className={`transition-colors cursor-pointer ${isSortOpen ? "text-white" : "text-[#57534e] hover:text-[#a8a29e]"}`}
+                    >
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 4h13M3 8h9M3 12h5m5 4l4 4m0 0l4-4m-4 4V8" />
+                      </svg>
+                    </button>
+                  </Tooltip>
+                  {isSortOpen && (
+                    <div className="absolute right-0 mt-1 z-50 bg-[#1c1917] border border-[#292524] rounded-lg shadow-xl py-1 min-w-[150px]">
+                      {SORT_OPTIONS.map((opt) => {
+                        const active = opt.key === sortKey;
+                        return (
+                          <button
+                            key={opt.key}
+                            onClick={() => chooseSort(opt.key)}
+                            className={`w-full px-3 py-2 text-left text-xs flex items-center justify-between gap-2 hover:bg-[#292524] hover:text-white transition-colors cursor-pointer ${active ? "text-amber-400" : "text-[#a8a29e]"}`}
+                          >
+                            <span>{opt.label}</span>
+                            {active && (
+                              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                {sortDir === "asc" ? (
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 15l7-7 7 7" />
+                                ) : (
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                                )}
+                              </svg>
+                            )}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
+              {items.length > 0 && activeUploads.length === 0 && (
                 <Tooltip text="Search uploads">
                   <button
                     onClick={openSearch}
@@ -964,7 +1063,7 @@ export function History({ items, uploads, onDelete, onClearUploads, onSetPasswor
               <p className="text-sm text-[#57534e]">No files matching "{searchQuery}"</p>
             </div>
           )}
-          {items.map((item) => {
+          {sortedItems.map((item) => {
             const isExpanded = expandedCollections.has(item.id);
             const hasFiles = item.is_collection && item.files && item.files.length > 0;
             const menuKey = `item-${item.id}`;
