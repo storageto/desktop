@@ -1,5 +1,5 @@
 name: Build and Release
-
+# adding linux support to thre build file
 on:
   push:
     tags:
