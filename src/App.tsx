@@ -178,16 +178,23 @@ function App() {
     };
   }, []);
 
-  // Refresh premium status after login
+  // Any auth change (login via deep link, logout from Settings) swaps which
+  // history the server returns (account files vs visitor files), so refresh
+  // premium state, the limits bar AND the list immediately - not on next focus.
+  const handleAuthChanged = useCallback(() => {
+    invoke<{ logged_in: boolean; is_premium?: boolean }>("get_auth_status")
+      .then((s) => setIsPremium(s.logged_in && (s.is_premium ?? false)))
+      .catch(() => {});
+    bumpLimits();
+    fullListRef.current = [];
+    fetchHistory(searchQuery.trim() || null);
+  }, [bumpLimits, fetchHistory, searchQuery]);
+
+  // Refresh after login
   useEffect(() => {
-    const unlisten = listen("auth-token-received", () => {
-      invoke<{ logged_in: boolean; is_premium?: boolean }>("get_auth_status")
-        .then((s) => setIsPremium(s.logged_in && (s.is_premium ?? false)))
-        .catch(() => {});
-      bumpLimits();
-    });
+    const unlisten = listen("auth-token-received", handleAuthChanged);
     return () => { unlisten.then((fn) => fn()); };
-  }, [bumpLimits]);
+  }, [handleAuthChanged]);
 
   // Listen for open-settings event from tray menu
   useEffect(() => {
@@ -802,12 +809,7 @@ function App() {
           onClose={() => setSettingsOpen(false)}
           appVersion={appVersion}
           addToast={addToast}
-          onAuthChanged={() => {
-            invoke<{ logged_in: boolean; is_premium?: boolean }>("get_auth_status")
-              .then((s) => setIsPremium(s.logged_in && (s.is_premium ?? false)))
-              .catch(() => {});
-            bumpLimits();
-          }}
+          onAuthChanged={handleAuthChanged}
         />
 
         {/* Auto-shown QR code (on upload complete, when the setting is on) */}
