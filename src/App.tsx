@@ -3,7 +3,9 @@ import { invoke, Channel } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { sendNotification, isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { DropZone } from "./components/DropZone";
+import { StatusBar } from "./components/StatusBar";
 import { History, HistoryItem, UploadItem, QrModal } from "./components/History";
 import { Settings } from "./components/Settings";
 import { ToastContainer, useToast } from "./components/Toast";
@@ -91,6 +93,10 @@ function App() {
   const [isPremium, setIsPremium] = useState(false);
   // Auto-show-on-complete QR modal (opt-in setting). Null when hidden.
   const [qrModal, setQrModal] = useState<{ url: string; filename: string } | null>(null);
+  // Bumped whenever quota state may have changed (upload done/failed, login),
+  // so the status bar re-fetches /api/limits.
+  const [limitsRefresh, setLimitsRefresh] = useState(0);
+  const bumpLimits = useCallback(() => setLimitsRefresh((n) => n + 1), []);
   const { toasts, addToast, dismissToast } = useToast();
 
   // Derived: are there active uploads in progress?
@@ -178,9 +184,10 @@ function App() {
       invoke<{ logged_in: boolean; is_premium?: boolean }>("get_auth_status")
         .then((s) => setIsPremium(s.logged_in && (s.is_premium ?? false)))
         .catch(() => {});
+      bumpLimits();
     });
     return () => { unlisten.then((fn) => fn()); };
-  }, []);
+  }, [bumpLimits]);
 
   // Listen for open-settings event from tray menu
   useEffect(() => {
@@ -334,6 +341,7 @@ function App() {
           // Refresh history first, then clear uploads so file doesn't vanish
           await fetchHistory(searchQuery.trim() || null);
           setUploads([]);
+          bumpLimits();
           await maybeShowQrOnComplete(result.url, result.filename);
           return;
         } catch {
@@ -377,6 +385,7 @@ function App() {
         // Refresh history — server generates thumbnails async, will appear on next focus
         await fetchHistory(searchQuery.trim() || null);
         setUploads([]);
+        bumpLimits();
         await maybeShowQrOnComplete(lastResult.url, lastResult.filename);
       }
     } catch (err) {
@@ -404,6 +413,23 @@ function App() {
         )
       );
 
+      // The anonymous daily cap (429): prompt to create a free account instead
+      // of a generic failure. The status bar turns red via bumpLimits below.
+      if (errorMsg.startsWith("Daily upload limit reached")) {
+        addToast({
+          title: "Daily limit reached",
+          description: errorMsg,
+          type: "error",
+          action: {
+            label: "Create free account",
+            onClick: () => {
+              openUrl("https://storage.to/desktop/login").catch(() => {});
+            },
+          },
+        });
+      }
+
+      bumpLimits();
       await showNotification("Upload failed", errorMsg);
     }
   };
@@ -441,6 +467,7 @@ function App() {
       // Refresh history — server generates thumbnails async, will appear on next focus
       await fetchHistory(searchQuery.trim() || null);
       setUploads([]);
+      bumpLimits();
       await maybeShowQrOnComplete(result.url, result.filename);
     } catch (err) {
       console.error("[Screenshot] Error:", err);
@@ -765,6 +792,9 @@ function App() {
           onSearchQueryChange={setSearchQuery}
           isSearching={isSearching}
         />
+
+        {/* Account/limits status bar (Dropbox-style, pinned to the bottom) */}
+        <StatusBar refreshKey={limitsRefresh} />
 
         {/* Settings panel (slides over content) */}
         <Settings
