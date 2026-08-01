@@ -43,8 +43,10 @@ export function StatusBar({ refreshKey }: StatusBarProps) {
   }, [refresh]);
 
   const handleCreateAccount = useCallback(() => {
-    openUrl("https://storage.to/desktop/login").catch((e) =>
-      console.error("[StatusBar] failed to open login:", e)
+    // Signup auto-signs-in and ?desktop=1 threads through to the token mint,
+    // so a fresh account deep-links straight back into the app.
+    openUrl("https://storage.to/register?desktop=1").catch((e) =>
+      console.error("[StatusBar] failed to open signup:", e)
     );
   }, []);
 

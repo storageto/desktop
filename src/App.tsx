@@ -423,7 +423,7 @@ function App() {
           action: {
             label: "Create free account",
             onClick: () => {
-              openUrl("https://storage.to/desktop/login").catch(() => {});
+              openUrl("https://storage.to/register?desktop=1").catch(() => {});
             },
           },
         });
@@ -802,6 +802,12 @@ function App() {
           onClose={() => setSettingsOpen(false)}
           appVersion={appVersion}
           addToast={addToast}
+          onAuthChanged={() => {
+            invoke<{ logged_in: boolean; is_premium?: boolean }>("get_auth_status")
+              .then((s) => setIsPremium(s.logged_in && (s.is_premium ?? false)))
+              .catch(() => {});
+            bumpLimits();
+          }}
         />
 
         {/* Auto-shown QR code (on upload complete, when the setting is on) */}

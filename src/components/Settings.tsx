@@ -21,6 +21,9 @@ interface SettingsProps {
   onClose: () => void;
   appVersion: string | null;
   addToast: (toast: { title: string; description?: string; type: "success" | "error" | "info" }) => void;
+  // Fired after a successful logout so the app shell (status bar, premium
+  // state) refreshes immediately, not on the next window focus.
+  onAuthChanged?: () => void;
 }
 
 function Toggle({ checked, onChange }: { checked: boolean; onChange: (val: boolean) => void }) {
@@ -64,7 +67,7 @@ function getDefaultShortcut(): string {
   return isMac ? "Command+Shift+S" : "Control+Shift+S";
 }
 
-export function Settings({ isOpen, onClose, appVersion, addToast }: SettingsProps) {
+export function Settings({ isOpen, onClose, appVersion, addToast, onAuthChanged }: SettingsProps) {
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [autostart, setAutostart] = useState(false);
   const [recording, setRecording] = useState(false);
@@ -221,6 +224,7 @@ export function Settings({ isOpen, onClose, appVersion, addToast }: SettingsProp
       await invoke("logout");
       setAuthStatus({ logged_in: false });
       loadConfig();
+      onAuthChanged?.();
       addToast({ title: "Logged out", type: "success" });
     } catch (e) {
       console.error("Failed to logout:", e);
