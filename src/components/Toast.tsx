@@ -5,6 +5,9 @@ export interface ToastMessage {
   title: string;
   description?: string;
   type: "success" | "error" | "info";
+  // Optional call-to-action button (e.g. "Create free account" on the daily
+  // limit toast). Action toasts stick around longer so the button is usable.
+  action?: { label: string; onClick: () => void };
 }
 
 interface ToastProps {
@@ -19,10 +22,10 @@ function Toast({ toast, onDismiss }: ToastProps) {
     const timer = setTimeout(() => {
       setIsExiting(true);
       setTimeout(() => onDismiss(toast.id), 200);
-    }, 3000);
+    }, toast.action ? 8000 : 3000);
 
     return () => clearTimeout(timer);
-  }, [toast.id, onDismiss]);
+  }, [toast.id, toast.action, onDismiss]);
 
   const iconColor = toast.type === "success"
     ? "text-emerald-400"
@@ -66,6 +69,18 @@ function Toast({ toast, onDismiss }: ToastProps) {
         <p className="text-sm font-medium text-white">{toast.title}</p>
         {toast.description && (
           <p className="text-xs text-[#a8a29e] mt-0.5">{toast.description}</p>
+        )}
+        {toast.action && (
+          <button
+            onClick={() => {
+              toast.action!.onClick();
+              setIsExiting(true);
+              setTimeout(() => onDismiss(toast.id), 200);
+            }}
+            className="mt-1.5 px-2.5 py-1 text-xs font-medium bg-pink-500/20 text-pink-400 hover:bg-pink-500/30 hover:text-pink-300 rounded-lg transition-colors cursor-pointer"
+          >
+            {toast.action.label}
+          </button>
         )}
       </div>
 

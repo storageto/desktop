@@ -1263,6 +1263,43 @@ async fn get_auth_status(state: State<'_, AppState>) -> Result<serde_json::Value
     Ok(serde_json::json!({ "logged_in": true }))
 }
 
+/// Fetch upload limits for the status bar. Anonymous callers get the daily
+/// upload cap and usage ({logged_in:false, limit, used, remaining}); signed-in
+/// users are exempt and get their plan ({logged_in:true, plan, is_premium}).
+/// The endpoint's usage peek is read-only, so polling never consumes quota.
+#[tauri::command]
+async fn get_limits(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let api_url = get_api_url();
+    let auth_token = {
+        let config = state.config.lock().unwrap();
+        config.auth_token.clone()
+    };
+    let visitor_token = get_visitor_token();
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("http client: {}", e))?;
+
+    let mut req = client
+        .get(format!("{}/api/limits", api_url))
+        .header("Accept", "application/json");
+    if let Some(token) = &auth_token {
+        req = req.header("Authorization", format!("Bearer {}", token));
+    }
+    if let Some(token) = &visitor_token {
+        req = req.header("X-Visitor-Token", token);
+    }
+
+    let resp = req.send().await.map_err(|e| format!("fetch limits: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("limits failed ({})", resp.status()));
+    }
+    resp.json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("parse limits: {}", e))
+}
+
 /// On first login, if the user is premium and hasn't set a default expiry preference,
 /// auto-set it to 0 (permanent) so their uploads stay forever by default.
 async fn set_permanent_default_if_premium_first_login(app: &AppHandle, token: &str) {
@@ -1807,6 +1844,7 @@ pub fn run() {
             get_screenshot_shortcut,
             update_screenshot_shortcut,
             get_auth_status,
+            get_limits,
             logout,
         ])
         .run(tauri::generate_context!())

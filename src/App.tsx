@@ -3,7 +3,9 @@ import { invoke, Channel } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { sendNotification, isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { DropZone } from "./components/DropZone";
+import { StatusBar } from "./components/StatusBar";
 import { History, HistoryItem, UploadItem, QrModal } from "./components/History";
 import { Settings } from "./components/Settings";
 import { ToastContainer, useToast } from "./components/Toast";
@@ -91,6 +93,10 @@ function App() {
   const [isPremium, setIsPremium] = useState(false);
   // Auto-show-on-complete QR modal (opt-in setting). Null when hidden.
   const [qrModal, setQrModal] = useState<{ url: string; filename: string } | null>(null);
+  // Bumped whenever quota state may have changed (upload done/failed, login),
+  // so the status bar re-fetches /api/limits.
+  const [limitsRefresh, setLimitsRefresh] = useState(0);
+  const bumpLimits = useCallback(() => setLimitsRefresh((n) => n + 1), []);
   const { toasts, addToast, dismissToast } = useToast();
 
   // Derived: are there active uploads in progress?
@@ -172,15 +178,23 @@ function App() {
     };
   }, []);
 
-  // Refresh premium status after login
+  // Any auth change (login via deep link, logout from Settings) swaps which
+  // history the server returns (account files vs visitor files), so refresh
+  // premium state, the limits bar AND the list immediately - not on next focus.
+  const handleAuthChanged = useCallback(() => {
+    invoke<{ logged_in: boolean; is_premium?: boolean }>("get_auth_status")
+      .then((s) => setIsPremium(s.logged_in && (s.is_premium ?? false)))
+      .catch(() => {});
+    bumpLimits();
+    fullListRef.current = [];
+    fetchHistory(searchQuery.trim() || null);
+  }, [bumpLimits, fetchHistory, searchQuery]);
+
+  // Refresh after login
   useEffect(() => {
-    const unlisten = listen("auth-token-received", () => {
-      invoke<{ logged_in: boolean; is_premium?: boolean }>("get_auth_status")
-        .then((s) => setIsPremium(s.logged_in && (s.is_premium ?? false)))
-        .catch(() => {});
-    });
+    const unlisten = listen("auth-token-received", handleAuthChanged);
     return () => { unlisten.then((fn) => fn()); };
-  }, []);
+  }, [handleAuthChanged]);
 
   // Listen for open-settings event from tray menu
   useEffect(() => {
@@ -334,6 +348,7 @@ function App() {
           // Refresh history first, then clear uploads so file doesn't vanish
           await fetchHistory(searchQuery.trim() || null);
           setUploads([]);
+          bumpLimits();
           await maybeShowQrOnComplete(result.url, result.filename);
           return;
         } catch {
@@ -377,6 +392,7 @@ function App() {
         // Refresh history — server generates thumbnails async, will appear on next focus
         await fetchHistory(searchQuery.trim() || null);
         setUploads([]);
+        bumpLimits();
         await maybeShowQrOnComplete(lastResult.url, lastResult.filename);
       }
     } catch (err) {
@@ -404,6 +420,23 @@ function App() {
         )
       );
 
+      // The anonymous daily cap (429): prompt to create a free account instead
+      // of a generic failure. The status bar turns red via bumpLimits below.
+      if (errorMsg.startsWith("Daily upload limit reached")) {
+        addToast({
+          title: "Daily limit reached",
+          description: errorMsg,
+          type: "error",
+          action: {
+            label: "Create free account",
+            onClick: () => {
+              openUrl("https://storage.to/register?desktop=1").catch(() => {});
+            },
+          },
+        });
+      }
+
+      bumpLimits();
       await showNotification("Upload failed", errorMsg);
     }
   };
@@ -441,6 +474,7 @@ function App() {
       // Refresh history — server generates thumbnails async, will appear on next focus
       await fetchHistory(searchQuery.trim() || null);
       setUploads([]);
+      bumpLimits();
       await maybeShowQrOnComplete(result.url, result.filename);
     } catch (err) {
       console.error("[Screenshot] Error:", err);
@@ -766,12 +800,16 @@ function App() {
           isSearching={isSearching}
         />
 
+        {/* Account/limits status bar (Dropbox-style, pinned to the bottom) */}
+        <StatusBar refreshKey={limitsRefresh} />
+
         {/* Settings panel (slides over content) */}
         <Settings
           isOpen={settingsOpen}
           onClose={() => setSettingsOpen(false)}
           appVersion={appVersion}
           addToast={addToast}
+          onAuthChanged={handleAuthChanged}
         />
 
         {/* Auto-shown QR code (on upload complete, when the setting is on) */}
