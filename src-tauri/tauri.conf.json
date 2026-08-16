@@ -31,7 +31,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; connect-src 'self' https://storage.to https://*.storage.to https://stusercontent.com https://*.stusercontent.com https://*.r2.cloudflarestorage.com https://*.cloudflare.com; img-src 'self' data: blob: https://storage.to https://*.storage.to https://stusercontent.com https://*.stusercontent.com; media-src 'self' blob: https://stusercontent.com https://*.stusercontent.com; style-src 'self' 'unsafe-inline'"
+      "csp": "default-src 'self'; connect-src 'self' https://storage.to https://*.storage.to https://stusercontent.com https://*.stusercontent.com https://*.r2.cloudflarestorage.com https://*.cloudflare.com; img-src 'self' data: blob: https:; media-src 'self' blob: https:; style-src 'self' 'unsafe-inline'"
     }
   },
   "plugins": {
