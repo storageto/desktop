@@ -969,7 +969,7 @@ async fn fetch_remote_history(query: Option<String>) -> Result<Vec<UploadHistory
         (format!("{}/api/files", api_url), false)
     };
 
-    let client = reqwest::Client::builder()
+    let client = upload::api_client_builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| format!("http client: {}", e))?;
@@ -1230,7 +1230,9 @@ async fn get_auth_status(state: State<'_, AppState>) -> Result<serde_json::Value
 
     // Fetch user info from API
     let api_url = get_api_url();
-    let client = reqwest::Client::new();
+    let client = upload::api_client_builder()
+        .build()
+        .map_err(|e| format!("http client: {}", e))?;
     let response = client
         .get(format!("{}/api/user", api_url))
         .header("Authorization", format!("Bearer {}", token))
@@ -1276,7 +1278,7 @@ async fn get_limits(state: State<'_, AppState>) -> Result<serde_json::Value, Str
     };
     let visitor_token = get_visitor_token();
 
-    let client = reqwest::Client::builder()
+    let client = upload::api_client_builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| format!("http client: {}", e))?;
@@ -1304,7 +1306,9 @@ async fn get_limits(state: State<'_, AppState>) -> Result<serde_json::Value, Str
 /// auto-set it to 0 (permanent) so their uploads stay forever by default.
 async fn set_permanent_default_if_premium_first_login(app: &AppHandle, token: &str) {
     let api_url = get_api_url();
-    let client = reqwest::Client::new();
+    let Ok(client) = upload::api_client_builder().build() else {
+        return;
+    };
     let Ok(resp) = client
         .get(format!("{}/api/user", api_url))
         .header("Authorization", format!("Bearer {}", token))
@@ -1383,9 +1387,8 @@ async fn logout(state: State<'_, AppState>) -> Result<(), String> {
     };
 
     // Revoke token on API (fire and forget)
-    if let Some(token) = &auth_token {
+    if let (Some(token), Ok(client)) = (&auth_token, upload::api_client_builder().build()) {
         let api_url = get_api_url();
-        let client = reqwest::Client::new();
         let _ = client
             .post(format!("{}/api/auth/logout", api_url))
             .header("Authorization", format!("Bearer {}", token))
@@ -1407,7 +1410,9 @@ async fn send_analytics_event(event: &str, context: Option<serde_json::Value>) {
     let auth_token = get_auth_token();
     let version = env!("CARGO_PKG_VERSION");
 
-    let client = reqwest::Client::new();
+    let Ok(client) = upload::api_client_builder().build() else {
+        return;
+    };
     let mut body = serde_json::json!({
         "app": "desktop",
         "version": version,

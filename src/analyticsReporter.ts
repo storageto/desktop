@@ -183,6 +183,7 @@ async function processQueue(): Promise<void> {
       const headers: Record<string, string> = {
         "Content-Type": "application/json",
         "Accept": "application/json",
+        "X-Storageto-Client": "desktop",
       };
 
       // Add visitor token if available
