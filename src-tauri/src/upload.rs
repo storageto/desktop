@@ -254,6 +254,26 @@ fn get_content_type(path: &Path) -> String {
         .to_string()
 }
 
+/// Whether a failed API response is worth retrying. 5xx is transient, and the
+/// per-minute throttle 429 ({"message":"Too Many Requests"} + Retry-After)
+/// clears on its own. Every other 4xx is terminal - in particular the
+/// anonymous daily quota 429s ({error, limit, used} for the file-count cap,
+/// {error, limit_gb, used_gb} for the byte quota): the count cap records every
+/// attempt BEFORE checking, so auto-retrying a tripped cap keeps it tripped.
+fn should_retry_api_error(status: reqwest::StatusCode, body: &str) -> bool {
+    if status.is_server_error() {
+        return true;
+    }
+    if status.as_u16() == 429 {
+        // Quota 429s carry an app-level `error` field; the transient throttle
+        // body only has `message`. An unparseable body gets retried.
+        return serde_json::from_str::<serde_json::Value>(body)
+            .map(|v| v.get("error").is_none())
+            .unwrap_or(true);
+    }
+    false
+}
+
 /// Initialize multiple uploads in a single API call (max 250 files per batch)
 pub async fn init_batch(files: Vec<BatchFileRequest>) -> Result<std::collections::HashMap<String, InitBatchResult>, String> {
     let client = get_client();
@@ -342,9 +362,13 @@ pub async fn confirm_batch(
         };
 
         if !response.status().is_success() {
+            let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
             last_error = format!("Confirm batch failed: {}", error_text);
             debug_log(&format!("[Batch] {}", last_error));
+            if !should_retry_api_error(status, &error_text) {
+                return Err(last_error);
+            }
             continue;
         }
 
@@ -853,9 +877,13 @@ async fn upload_multipart_v2(
         };
 
         if !resp.status().is_success() {
+            let status = resp.status();
             let error_text = resp.text().await.unwrap_or_default();
             last_error = format!("Complete multipart failed: {}", error_text);
             debug_log(&format!("[Multipart] {}", last_error));
+            if !should_retry_api_error(status, &error_text) {
+                return Err(last_error);
+            }
             continue;
         }
 
@@ -1077,9 +1105,13 @@ pub async fn mark_collection_ready(collection_id: String) -> Result<CollectionIn
         };
 
         if !response.status().is_success() {
+            let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
             last_error = format!("Mark collection ready failed: {}", error_text);
             debug_log(&format!("[Collection] {}", last_error));
+            if !should_retry_api_error(status, &error_text) {
+                return Err(last_error);
+            }
             continue;
         }
 
@@ -1144,6 +1176,153 @@ pub async fn delete_file(file_id: String, is_collection: bool) -> Result<(), Str
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use reqwest::StatusCode;
+
+    // Real bodies from the API (bandwidth-window.ts overCountError /
+    // bandwidth/index.ts overLimitError / rate-limit.ts tooManyRequests).
+    const COUNT_CAP_429: &str = r#"{"success":false,"error":"Daily upload limit reached (50 files in 24 hours). Create a free account for higher limits.","limit":50,"used":51}"#;
+    const BYTE_QUOTA_429: &str = r#"{"success":false,"error":"Daily bandwidth limit exceeded.","limit_gb":100,"used_gb":101}"#;
+    const THROTTLE_429: &str = r#"{"message":"Too Many Requests"}"#;
+
+    #[test]
+    fn server_errors_retry() {
+        assert!(should_retry_api_error(StatusCode::INTERNAL_SERVER_ERROR, ""));
+        assert!(should_retry_api_error(StatusCode::BAD_GATEWAY, "<html>502</html>"));
+    }
+
+    #[test]
+    fn throttle_429_retries() {
+        assert!(should_retry_api_error(StatusCode::TOO_MANY_REQUESTS, THROTTLE_429));
+    }
+
+    #[test]
+    fn quota_429s_are_terminal() {
+        assert!(!should_retry_api_error(StatusCode::TOO_MANY_REQUESTS, COUNT_CAP_429));
+        assert!(!should_retry_api_error(StatusCode::TOO_MANY_REQUESTS, BYTE_QUOTA_429));
+    }
+
+    #[test]
+    fn unparseable_429_retries() {
+        assert!(should_retry_api_error(StatusCode::TOO_MANY_REQUESTS, "gateway timeout"));
+    }
+
+    #[test]
+    fn other_client_errors_are_terminal() {
+        assert!(!should_retry_api_error(StatusCode::BAD_REQUEST, r#"{"success":false,"error":"bad"}"#));
+        assert!(!should_retry_api_error(StatusCode::FORBIDDEN, ""));
+    }
+
+    /// Behavior check against a live stub server: a quota 429 must abort
+    /// confirm_batch after exactly ONE request; a throttle 429 must still be
+    /// retried. Mutates $HOME (config isolation), so it is ignored in a normal
+    /// run - execute manually:
+    ///   cargo test retry_behavior -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "mutates $HOME for config isolation; run manually"]
+    async fn retry_behavior_against_stub_server() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        fn serve(listener: TcpListener, responses: Vec<(u16, &'static str, String)>, hits: Arc<AtomicU32>) {
+            std::thread::spawn(move || {
+                for (status, reason, body) in responses {
+                    let (mut stream, _) = match listener.accept() {
+                        Ok(s) => s,
+                        Err(_) => return,
+                    };
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    // Drain the request (headers + JSON body) before answering.
+                    let mut buf = [0u8; 65536];
+                    let _ = stream.read(&mut buf);
+                    let _ = stream.write_all(
+                        format!(
+                            "HTTP/1.1 {} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            status, reason, body.len(), body
+                        )
+                        .as_bytes(),
+                    );
+                }
+            });
+        }
+
+        let fake_home = std::env::temp_dir().join(format!("storageto-retry-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&fake_home).unwrap();
+        std::env::set_var("HOME", &fake_home);
+
+        let files = vec![BatchConfirmFile {
+            filename: "a.txt".to_string(),
+            size: 1,
+            content_type: "text/plain".to_string(),
+            r2_key: "k".to_string(),
+        }];
+
+        // Case 0: the count cap fires at /api/upload/init - upload_file must
+        // fail on the first 429 with the cap's message, no second request.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicU32::new(0));
+        serve(listener, vec![(429, "Too Many Requests", COUNT_CAP_429.to_string())], hits.clone());
+
+        let mut config = crate::storage::AppConfig::new();
+        config.api_url = format!("http://{}", addr);
+        crate::storage::save_config(&config).unwrap();
+
+        let capped_file = fake_home.join("capped.txt");
+        std::fs::write(&capped_file, b"over the daily cap").unwrap();
+        let err = upload_file(
+            capped_file.to_string_lossy().to_string(),
+            None,
+            Channel::new(|_| Ok(())),
+            None,
+        )
+        .await
+        .expect_err("init 429 must fail the upload");
+        assert!(err.contains("Daily upload limit reached"), "err: {}", err);
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "a capped init must not be retried");
+
+        // Case 1: quota 429 at confirm-batch -> terminal after exactly one request.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicU32::new(0));
+        serve(listener, vec![(429, "Too Many Requests", BYTE_QUOTA_429.to_string())], hits.clone());
+
+        let mut config = crate::storage::AppConfig::new();
+        config.api_url = format!("http://{}", addr);
+        crate::storage::save_config(&config).unwrap();
+
+        let err = confirm_batch(None, files.clone()).await.expect_err("quota 429 must fail");
+        assert!(err.contains("Daily bandwidth limit"), "err: {}", err);
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "quota 429 must not be retried");
+
+        // Case 2: throttle 429 then success -> retried and succeeds.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicU32::new(0));
+        let ok_body = r#"{"success":true,"results":{"a.txt":{"success":true,"file":{"id":"x","url":"http://x/f"}}}}"#;
+        serve(
+            listener,
+            vec![
+                (429, "Too Many Requests", THROTTLE_429.to_string()),
+                (200, "OK", ok_body.to_string()),
+            ],
+            hits.clone(),
+        );
+
+        let mut config = crate::storage::AppConfig::new();
+        config.api_url = format!("http://{}", addr);
+        crate::storage::save_config(&config).unwrap();
+
+        let results = confirm_batch(None, files).await.expect("throttle 429 must be retried to success");
+        assert_eq!(results.len(), 1);
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "throttle 429 should retry once then succeed");
+    }
 }
 
 pub async fn set_password(file_id: String, is_collection: bool, password: String) -> Result<(), String> {
