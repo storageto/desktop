@@ -2,7 +2,10 @@
  * Analytics Reporter - Usage tracking for StorageTo Desktop
  *
  * Tracks app usage events like launches, uploads, and screenshots.
- * Queues events locally and sends to API with retry logic.
+ * Queues events locally and delivers via the Rust backend (send_app_event),
+ * which attaches identity headers and stamps app/version. Delivery must NOT
+ * use webview fetch(): WKWebView enforces CORS for the tauri:// origin and
+ * the API has no preflight handling, so fetch() here never delivered (#18).
  *
  * NOTE: Heartbeat is handled by Rust backend (see lib.rs) since JavaScript
  * setInterval doesn't fire reliably when the Tauri window is hidden (menu bar app).
@@ -11,7 +14,6 @@
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 
-const API_URL = "https://storage.to/api/app-analytics";
 const MAX_QUEUE_SIZE = 100;
 const RETRY_DELAY_MS = 5000;
 const MAX_RETRIES = 3;
@@ -30,8 +32,6 @@ let eventQueue: AnalyticsEvent[] = [];
 let isProcessingQueue = false;
 let appVersion: string | null = null;
 let osInfo: { platform: string } | null = null;
-let visitorToken: string | null = null;
-let authToken: string | null = null;
 
 /**
  * Get OS info from userAgent (simple approach without extra plugin)
@@ -42,31 +42,6 @@ function getOsFromUserAgent(): { platform: string } {
   if (ua.includes("win")) return { platform: "windows" };
   if (ua.includes("linux")) return { platform: "linux" };
   return { platform: "unknown" };
-}
-
-/**
- * Get visitor token from Rust storage via Tauri command
- */
-async function getVisitorTokenFromRust(): Promise<string | null> {
-  try {
-    return await invoke<string | null>("get_visitor_token_command");
-  } catch (e) {
-    console.warn("[Analytics] Failed to get visitor token from Rust:", e);
-    return null;
-  }
-}
-
-/**
- * Get auth token from Rust config via Tauri command
- */
-async function getAuthTokenFromRust(): Promise<string | null> {
-  try {
-    const config = await invoke<{ auth_token: string | null }>("get_config");
-    return config.auth_token;
-  } catch (e) {
-    console.warn("[Analytics] Failed to get auth token from Rust:", e);
-    return null;
-  }
 }
 
 /**
@@ -83,10 +58,6 @@ export async function initAnalyticsReporter(): Promise<void> {
   // Get OS info from userAgent
   osInfo = getOsFromUserAgent();
 
-  // Get visitor token and auth token from Rust storage
-  visitorToken = await getVisitorTokenFromRust();
-  authToken = await getAuthTokenFromRust();
-
   // Load any queued events from previous session
   loadQueueFromStorage();
 
@@ -101,7 +72,7 @@ export async function initAnalyticsReporter(): Promise<void> {
   // NOTE: Heartbeat is handled by Rust backend (lib.rs) since JavaScript
   // setInterval doesn't fire reliably when the Tauri window is hidden
 
-  console.log("[Analytics] Initialized with visitor token:", visitorToken?.substring(0, 8) + "...");
+  console.log("[Analytics] Initialized");
 }
 
 /**
@@ -170,60 +141,29 @@ async function processQueue(): Promise<void> {
 
   isProcessingQueue = true;
 
-  // Refresh tokens in case they were set after init
-  if (!visitorToken) {
-    visitorToken = await getVisitorTokenFromRust();
-  }
-  authToken = await getAuthTokenFromRust();
-
   while (eventQueue.length > 0) {
     const event = eventQueue[0];
 
     try {
-      const headers: Record<string, string> = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "X-Storageto-Client": "desktop",
-      };
-
-      // Add visitor token if available
-      if (visitorToken) {
-        headers["X-Visitor-Token"] = visitorToken;
-      }
-
-      // Add auth token if logged in
-      if (authToken) {
-        headers["Authorization"] = `Bearer ${authToken}`;
-      }
-
-      const response = await fetch(API_URL, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          app: event.app,
-          version: event.version,
-          event: event.event,
-          context: event.context,
-        }),
+      // Rust attaches identity headers and stamps app/version.
+      // Errors: "status:<code>" for HTTP failures, "network:<msg>" otherwise.
+      await invoke("send_app_event", {
+        event: event.event,
+        context: event.context ?? null,
       });
 
-      if (response.ok) {
-        // Success - remove from queue
-        eventQueue.shift();
-        saveQueueToStorage();
-      } else if (response.status >= 400 && response.status < 500) {
+      // Success - remove from queue
+      eventQueue.shift();
+      saveQueueToStorage();
+    } catch (rawErr) {
+      const status = parseInt(String(rawErr).match(/^status:(\d+)/)?.[1] ?? "", 10);
+      if (status >= 400 && status < 500) {
         // Client error - don't retry, just remove
-        console.warn(
-          "[Analytics] Client error, dropping event:",
-          response.status
-        );
+        console.warn("[Analytics] Client error, dropping event:", status);
         eventQueue.shift();
         saveQueueToStorage();
-      } else {
-        // Server error - retry later
-        throw new Error(`Server error: ${response.status}`);
+        continue;
       }
-    } catch (e) {
       // Network error or server error - retry later
       event.retries++;
 
