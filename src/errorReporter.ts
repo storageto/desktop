@@ -137,6 +137,7 @@ async function processQueue(): Promise<void> {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
+          "X-Storageto-Client": "desktop",
         },
         body: JSON.stringify({
           app: report.app,

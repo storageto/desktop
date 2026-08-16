@@ -208,9 +208,19 @@ use std::sync::OnceLock;
 
 static HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
 
+/// Client builder for storage.to API calls. Declares the app via a default
+/// X-Storageto-Client header so uploads/downloads are attributed to `desktop`
+/// rather than falling through to the generic `api` bucket. A default header
+/// on the builder means a new endpoint can't silently regress attribution.
+pub fn api_client_builder() -> reqwest::ClientBuilder {
+    let mut headers = HeaderMap::new();
+    headers.insert("X-Storageto-Client", HeaderValue::from_static("desktop"));
+    Client::builder().default_headers(headers)
+}
+
 fn get_client() -> &'static Client {
     HTTP_CLIENT.get_or_init(|| {
-        Client::builder()
+        api_client_builder()
             // No overall timeout - uploads can take a long time
             // Only set connect timeout
             .connect_timeout(std::time::Duration::from_secs(30))
@@ -1321,6 +1331,90 @@ pub async fn remove_password(file_id: String, is_collection: bool) -> Result<(),
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write as IoWrite};
+    use std::net::TcpListener;
+
+    /// Every request made through api_client_builder() must carry
+    /// X-Storageto-Client: desktop, so uploads/downloads are attributed to the
+    /// desktop app instead of the generic `api` bucket.
+    #[tokio::test]
+    async fn api_client_declares_desktop_channel() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut headers = Vec::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("read");
+                if line.trim().is_empty() {
+                    break;
+                }
+                headers.push(line.trim().to_lowercase());
+            }
+            let mut stream = stream;
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n");
+            headers
+        });
+
+        let client = api_client_builder().build().expect("client");
+        let _ = client
+            .get(format!("http://{}/api/limits", addr))
+            .send()
+            .await
+            .expect("request");
+
+        let headers = server.join().expect("server thread");
+        assert!(
+            headers.contains(&"x-storageto-client: desktop".to_string()),
+            "missing X-Storageto-Client header, got: {:?}",
+            headers
+        );
+    }
+
+    /// Full round trip against a running local API (issue #9 acceptance check):
+    /// uploads through the app's real single-file path, then the file row must
+    /// have upload_channel = desktop. Ignored in CI; run manually with a local
+    /// API up:
+    ///   STORAGETO_TEST_API=http://localhost:8796 cargo test --release -- --ignored
+    #[tokio::test]
+    #[ignore = "needs a running local API (set STORAGETO_TEST_API)"]
+    async fn e2e_upload_declares_desktop_channel() {
+        let api = std::env::var("STORAGETO_TEST_API")
+            .unwrap_or_else(|_| "http://localhost:8796".to_string());
+
+        // Isolate config (api_url, visitor token, history) from the real app.
+        let fake_home = std::env::temp_dir().join(format!("storageto-e2e-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&fake_home).unwrap();
+        std::env::set_var("HOME", &fake_home);
+
+        let mut config = crate::storage::AppConfig::new();
+        config.api_url = api.clone();
+        crate::storage::save_config(&config).expect("save config");
+
+        let file_path = fake_home.join("issue-9-e2e.txt");
+        std::fs::write(&file_path, b"desktop channel attribution e2e (issue #9)").unwrap();
+
+        let progress = Channel::new(|_| Ok(()));
+        let result = upload_file(
+            file_path.to_string_lossy().to_string(),
+            None,
+            progress,
+            None,
+        )
+        .await
+        .expect("upload should succeed");
+
+        println!("uploaded: {}", result.url);
+        assert!(!result.url.is_empty());
+    }
 }
 
 pub async fn remove_burn_after_reading(file_id: String, is_collection: bool) -> Result<(), String> {
