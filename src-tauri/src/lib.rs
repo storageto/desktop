@@ -1403,28 +1403,31 @@ async fn logout(state: State<'_, AppState>) -> Result<(), String> {
     save_config(&config)
 }
 
-/// Send analytics event to API
-async fn send_analytics_event(event: &str, context: Option<serde_json::Value>) {
+/// POST a JSON body to a storage.to app-reporting endpoint with the standard
+/// identity headers (visitor token, auth bearer, X-Storageto-Client via the
+/// shared client builder). `app` and `version` are stamped here so callers
+/// can't drift. Errors come back as "status:<code>" for HTTP failures (so the
+/// frontend queue can drop 4xx and retry 5xx) or "network:<msg>" when no
+/// response arrived.
+///
+/// This lives in Rust because the webview cannot do it: WKWebView enforces
+/// CORS for the tauri:// origin and the API has no preflight handling, so
+/// webview fetch() to these endpoints has never delivered (see issue #18).
+pub async fn post_app_report(path: &str, mut body: serde_json::Value) -> Result<(), String> {
     let api_url = get_api_url();
     let visitor_token = get_visitor_token();
     let auth_token = get_auth_token();
-    let version = env!("CARGO_PKG_VERSION");
 
-    let Ok(client) = upload::api_client_builder().build() else {
-        return;
-    };
-    let mut body = serde_json::json!({
-        "app": "desktop",
-        "version": version,
-        "event": event,
-    });
+    body["app"] = serde_json::json!("desktop");
+    body["version"] = serde_json::json!(env!("CARGO_PKG_VERSION"));
 
-    if let Some(ctx) = context {
-        body["context"] = ctx;
-    }
+    let client = upload::api_client_builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("network:{}", e))?;
 
     let mut request = client
-        .post(format!("{}/api/app-analytics", api_url))
+        .post(format!("{}{}", api_url, path))
         .header("Accept", "application/json")
         .json(&body);
 
@@ -1436,8 +1439,40 @@ async fn send_analytics_event(event: &str, context: Option<serde_json::Value>) {
         request = request.header("Authorization", format!("Bearer {}", token));
     }
 
-    // Fire and forget - we don't care about the result for heartbeats
-    let _ = request.send().await;
+    let response = request.send().await.map_err(|e| format!("network:{}", e))?;
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("status:{}", response.status().as_u16()))
+    }
+}
+
+/// Send analytics event to API (fire and forget - heartbeats don't retry)
+async fn send_analytics_event(event: &str, context: Option<serde_json::Value>) {
+    let mut body = serde_json::json!({ "event": event });
+    if let Some(ctx) = context {
+        body["context"] = ctx;
+    }
+    let _ = post_app_report("/api/app-analytics", body).await;
+}
+
+/// Frontend analytics transport (analyticsReporter.ts). The webview queues and
+/// retries; this just delivers one event and reports the outcome.
+#[tauri::command]
+async fn send_app_event(event: String, context: Option<serde_json::Value>) -> Result<(), String> {
+    let mut body = serde_json::json!({ "event": event });
+    if let Some(ctx) = context {
+        body["context"] = ctx;
+    }
+    post_app_report("/api/app-analytics", body).await
+}
+
+/// Frontend error-report transport (errorReporter.ts). Same contract as
+/// send_app_event; `report` carries type/message/stack/os/context and Rust
+/// stamps app + version.
+#[tauri::command]
+async fn send_app_error(report: serde_json::Value) -> Result<(), String> {
+    post_app_report("/api/app-errors", report).await
 }
 
 /// Start the background heartbeat task using Tauri's async runtime
@@ -1851,7 +1886,93 @@ pub fn run() {
             get_auth_status,
             get_limits,
             logout,
+            send_app_event,
+            send_app_error,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod app_report_tests {
+    use super::*;
+    use std::io::{Read as IoRead, Write as IoWrite};
+    use std::net::TcpListener;
+
+    /// Full check of the reporting transport against a live stub server:
+    /// path, app/version stamping, identity header, and the status:/network:
+    /// error contract the frontend queues rely on. Mutates $HOME (config
+    /// isolation), so ignored in a normal run - execute manually:
+    ///   cargo test app_report -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "mutates $HOME for config isolation; run manually"]
+    async fn post_app_report_contract() {
+        let fake_home = std::env::temp_dir().join(format!("storageto-report-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&fake_home).unwrap();
+        std::env::set_var("HOME", &fake_home);
+
+        fn serve_one(listener: TcpListener, status_line: &'static str) -> std::thread::JoinHandle<String> {
+            std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut buf = [0u8; 65536];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let _ = stream.write_all(
+                    format!("HTTP/1.1 {}\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{{}}", status_line).as_bytes(),
+                );
+                req
+            })
+        }
+
+        // Case 1: success - request shape is right and Ok comes back.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = serve_one(listener, "200 OK");
+
+        let mut config = storage::AppConfig::new();
+        config.api_url = format!("http://{}", addr);
+        // Must be UUID-shaped or get_visitor_token() regenerates it.
+        config.visitor_token = Some("550e8400-e29b-41d4-a716-446655440000".to_string());
+        storage::save_config(&config).unwrap();
+
+        post_app_report("/api/app-analytics", serde_json::json!({ "event": "app_launch" }))
+            .await
+            .expect("200 must be Ok");
+        let req = server.join().unwrap();
+        let req_lower = req.to_lowercase();
+        assert!(req.starts_with("POST /api/app-analytics"), "path: {}", req.lines().next().unwrap_or(""));
+        assert!(req_lower.contains("x-storageto-client: desktop"), "missing client header");
+        assert!(req_lower.contains("x-visitor-token: 550e8400-e29b-41d4-a716-446655440000"), "missing visitor token");
+        assert!(req.contains(r#""app":"desktop""#), "app not stamped: {}", req);
+        assert!(req.contains(&format!(r#""version":"{}""#, env!("CARGO_PKG_VERSION"))), "version not stamped");
+        assert!(req.contains(r#""event":"app_launch""#), "event missing");
+
+        // Case 2: HTTP error surfaces as status:<code> (frontend drops 4xx).
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = serve_one(listener, "422 Unprocessable Entity");
+        let mut config = storage::AppConfig::new();
+        config.api_url = format!("http://{}", addr);
+        storage::save_config(&config).unwrap();
+
+        let err = post_app_report("/api/app-errors", serde_json::json!({ "type": "js_error", "message": "boom" }))
+            .await
+            .expect_err("422 must be Err");
+        assert_eq!(err, "status:422");
+        let req = server.join().unwrap();
+        assert!(req.starts_with("POST /api/app-errors"), "path: {}", req.lines().next().unwrap_or(""));
+
+        // Case 3: unreachable server surfaces as network:<msg> (frontend retries).
+        let dead = TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        drop(dead);
+        let mut config = storage::AppConfig::new();
+        config.api_url = format!("http://{}", dead_addr);
+        storage::save_config(&config).unwrap();
+
+        let err = post_app_report("/api/app-analytics", serde_json::json!({ "event": "heartbeat" }))
+            .await
+            .expect_err("dead server must be Err");
+        assert!(err.starts_with("network:"), "err: {}", err);
+    }
 }

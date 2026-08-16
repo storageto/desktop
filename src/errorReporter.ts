@@ -2,12 +2,15 @@
  * Error Reporter - DIY error tracking for StorageTo Desktop
  *
  * Catches JS errors, promise rejections, and custom events.
- * Queues errors locally and sends to API with retry logic.
+ * Queues errors locally and delivers via the Rust backend (send_app_error),
+ * which attaches identity headers and stamps app/version. Delivery must NOT
+ * use webview fetch(): WKWebView enforces CORS for the tauri:// origin and
+ * the API has no preflight handling, so fetch() here never delivered (#18).
  */
 
 import { getVersion } from "@tauri-apps/api/app";
+import { invoke } from "@tauri-apps/api/core";
 
-const API_URL = "https://storage.to/api/app-errors";
 const MAX_QUEUE_SIZE = 50;
 const RETRY_DELAY_MS = 5000;
 const MAX_RETRIES = 3;
@@ -133,15 +136,10 @@ async function processQueue(): Promise<void> {
     const report = errorQueue[0];
 
     try {
-      const response = await fetch(API_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Storageto-Client": "desktop",
-        },
-        body: JSON.stringify({
-          app: report.app,
-          version: report.version,
+      // Rust attaches identity headers and stamps app/version.
+      // Errors: "status:<code>" for HTTP failures, "network:<msg>" otherwise.
+      await invoke("send_app_error", {
+        report: {
           type: report.type,
           message: report.message,
           stack: report.stack,
@@ -149,23 +147,21 @@ async function processQueue(): Promise<void> {
           os_version: report.os_version,
           arch: report.arch,
           context: report.context,
-        }),
+        },
       });
 
-      if (response.ok) {
-        // Success - remove from queue
-        errorQueue.shift();
-        saveQueueToStorage();
-      } else if (response.status >= 400 && response.status < 500) {
+      // Success - remove from queue
+      errorQueue.shift();
+      saveQueueToStorage();
+    } catch (rawErr) {
+      const status = parseInt(String(rawErr).match(/^status:(\d+)/)?.[1] ?? "", 10);
+      if (status >= 400 && status < 500) {
         // Client error - don't retry, just remove
-        console.warn("[ErrorReporter] Client error, dropping report:", response.status);
+        console.warn("[ErrorReporter] Client error, dropping report:", status);
         errorQueue.shift();
         saveQueueToStorage();
-      } else {
-        // Server error - retry later
-        throw new Error(`Server error: ${response.status}`);
+        continue;
       }
-    } catch (e) {
       // Network error or server error - retry later
       report.retries++;
 
