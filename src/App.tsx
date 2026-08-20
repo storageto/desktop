@@ -24,6 +24,8 @@ interface UploadProgress {
   status: string;
   collection_id?: string;
   collection_name?: string;
+  /** Set when the server refused the file, so the row can say why. */
+  error?: string;
 }
 
 interface UploadResult {
@@ -32,6 +34,8 @@ interface UploadResult {
   size: number;
   is_collection: boolean;
   file_count?: number;
+  /** Files the user asked for, when the Rust side counted them (folders). */
+  attempted_count?: number;
 }
 
 // Parse error messages from Rust backend, extracting human-readable parts
@@ -306,6 +310,7 @@ function App() {
         status: progress.status as UploadItem["status"],
         collectionId: progress.collection_id,
         collectionName: progress.collection_name,
+        error: progress.error,
       };
 
       const existing = prev.find((u) => u.id === progress.file_id);
@@ -333,21 +338,35 @@ function App() {
 
           // Success - was a folder
           await copyToClipboard(result.url);
+          // A shortfall has to be in the headline. Saying "382 files uploaded"
+          // when 425 were asked for is how 43 missing files stayed unnoticed
+          // until a customer counted them by hand.
+          const landed = result.file_count ?? 0;
+          const asked = result.attempted_count ?? landed;
+          const short = asked - landed;
           await showNotification(
-            "Collection uploaded",
-            `${result.file_count} files uploaded - URL copied!`
+            short > 0 ? "Collection uploaded, some files failed" : "Collection uploaded",
+            short > 0
+              ? `${landed} of ${asked} files uploaded, ${short} failed - URL copied!`
+              : `${landed} files uploaded - URL copied!`
           );
 
           // Track analytics
           trackUploadComplete({
             fileCount: result.file_count || 1,
+            // The folder's own count, not paths.length - a folder drop hands
+            // over ONE path, so paths.length is 1 no matter how many files.
+            attemptedCount: result.attempted_count ?? result.file_count ?? 1,
             totalSize: result.size,
             isCollection: true,
           });
 
-          // Refresh history first, then clear uploads so file doesn't vanish
+          // Refresh history first, then clear uploads so file doesn't vanish.
+          // Failed rows STAY: they carry the only per-file reason the user ever
+          // sees, and clearing them the instant the collection finishes threw
+          // that away at exactly the moment it was worth reading.
           await fetchHistory(searchQuery.trim() || null);
-          setUploads([]);
+          setUploads((prev) => prev.filter((u) => u.status === "error"));
           bumpLimits();
           await maybeShowQrOnComplete(result.url, result.filename);
           return;
@@ -375,9 +394,15 @@ function App() {
           await showNotification("Upload complete", `${lastResult.filename} - URL copied!`);
         } else {
           const count = lastResult.file_count || fileResults.length;
+          // Same rule as the folder path: a shortfall belongs in the headline,
+          // not only in the rows behind it.
+          const asked = lastResult.attempted_count ?? paths.length;
+          const short = asked - count;
           await showNotification(
-            "Uploads complete",
-            `${count} files uploaded - URL copied!`
+            short > 0 ? "Uploads complete, some files failed" : "Uploads complete",
+            short > 0
+              ? `${count} of ${asked} files uploaded, ${short} failed - URL copied!`
+              : `${count} files uploaded - URL copied!`
           );
         }
 
@@ -385,13 +410,17 @@ function App() {
         const totalSize = fileResults.reduce((sum, r) => sum + r.size, 0) || lastResult.size;
         trackUploadComplete({
           fileCount: fileResults.length || 1,
+          // A multi-file selection: one path per file, so paths.length is the
+          // real attempted count. lastResult carries it too when Rust counted.
+          attemptedCount: lastResult.attempted_count ?? paths.length,
           totalSize,
           isCollection: lastResult.is_collection,
         });
 
-        // Refresh history — server generates thumbnails async, will appear on next focus
+        // Refresh history — server generates thumbnails async, will appear on next focus.
+        // Failed rows stay, so their reasons survive the success.
         await fetchHistory(searchQuery.trim() || null);
-        setUploads([]);
+        setUploads((prev) => prev.filter((u) => u.status === "error"));
         bumpLimits();
         await maybeShowQrOnComplete(lastResult.url, lastResult.filename);
       }
