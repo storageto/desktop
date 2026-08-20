@@ -113,9 +113,21 @@ export function trackUploadComplete(params: {
   fileCount: number;
   totalSize: number;
   isCollection: boolean;
+  /**
+   * How many files the user actually selected. Sent alongside the landed count
+   * so a shortfall is visible in the data at all.
+   *
+   * Without it, a 425-file folder that lands 382 files reports one success with
+   * file_count 382 and nothing else - indistinguishable from a 382-file folder
+   * that worked perfectly. That is how 43 missing files went unnoticed until a
+   * customer counted them by hand: the failure moved no signal we were
+   * watching, because the only signal we sent was the success.
+   */
+  attemptedCount: number;
 }): void {
   trackEvent("upload_complete", {
     file_count: params.fileCount,
+    attempted_count: params.attemptedCount,
     total_size: params.totalSize,
     is_collection: params.isCollection,
     os: osInfo?.platform,

@@ -34,6 +34,8 @@ interface UploadResult {
   size: number;
   is_collection: boolean;
   file_count?: number;
+  /** Files the user asked for, when the Rust side counted them (folders). */
+  attempted_count?: number;
 }
 
 // Parse error messages from Rust backend, extracting human-readable parts
@@ -344,6 +346,9 @@ function App() {
           // Track analytics
           trackUploadComplete({
             fileCount: result.file_count || 1,
+            // The folder's own count, not paths.length - a folder drop hands
+            // over ONE path, so paths.length is 1 no matter how many files.
+            attemptedCount: result.attempted_count ?? result.file_count ?? 1,
             totalSize: result.size,
             isCollection: true,
           });
@@ -388,6 +393,9 @@ function App() {
         const totalSize = fileResults.reduce((sum, r) => sum + r.size, 0) || lastResult.size;
         trackUploadComplete({
           fileCount: fileResults.length || 1,
+          // A multi-file selection: one path per file, so paths.length is the
+          // real attempted count. lastResult carries it too when Rust counted.
+          attemptedCount: lastResult.attempted_count ?? paths.length,
           totalSize,
           isCollection: lastResult.is_collection,
         });

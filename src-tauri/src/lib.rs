@@ -120,6 +120,9 @@ enum BatchWorkItem {
         idx: usize,
         file_info: FileInfo,
         upload_id: String,
+        /// The server's chunk size for THIS session, carried rather than
+        /// re-derived: the server decides where every part boundary falls.
+        part_size: Option<i64>,
         initial_urls: std::collections::HashMap<String, String>,
         r2_key: String,
     },
@@ -281,6 +284,7 @@ async fn upload_files_batch(
                 } else if let (Some(upload_id), Some(r2_key)) = (&init_result.upload_id, &init_result.r2_key) {
                     let _ = tx.send(BatchWorkItem::Multipart {
                         idx, file_info: fi, upload_id: upload_id.clone(),
+                        part_size: init_result.part_size,
                         initial_urls: init_result.initial_urls.clone().unwrap_or_default(),
                         r2_key: r2_key.clone(),
                     }).await;
@@ -398,9 +402,9 @@ async fn upload_files_batch(
                                 &progress, Some(coll_id.clone()), Some(coll_name.clone()),
                             ).await
                         }
-                        BatchWorkItem::Multipart { upload_id, initial_urls, .. } => {
+                        BatchWorkItem::Multipart { upload_id, part_size, initial_urls, .. } => {
                             upload_multipart_to_r2(
-                                path, &upload_id, &r2_key, file_info.size, initial_urls,
+                                path, &upload_id, &r2_key, file_info.size, part_size, initial_urls,
                                 &file_info.file_id, &file_info.filename, &progress,
                                 Some(coll_id.clone()), Some(coll_name.clone()),
                             ).await
@@ -489,6 +493,7 @@ async fn upload_files_batch(
                                     size: *size,
                                     is_collection: false,
                                     file_count: None,
+                                    attempted_count: None,
                                 });
                             }
                         }
@@ -558,6 +563,7 @@ async fn upload_files_batch(
         size: total_size,
         is_collection: true,
         file_count: Some(file_count),
+        attempted_count: Some(file_infos.len() as u32),
     });
 
     Ok(all_results)
@@ -696,6 +702,7 @@ async fn upload_folder(
                 } else if let (Some(upload_id), Some(r2_key)) = (&init_result.upload_id, &init_result.r2_key) {
                     let _ = tx.send(BatchWorkItem::Multipart {
                         idx, file_info: fi, upload_id: upload_id.clone(),
+                        part_size: init_result.part_size,
                         initial_urls: init_result.initial_urls.clone().unwrap_or_default(),
                         r2_key: r2_key.clone(),
                     }).await;
@@ -808,9 +815,9 @@ async fn upload_folder(
                                 &progress, Some(coll_id.clone()), Some(coll_name.clone()),
                             ).await
                         }
-                        BatchWorkItem::Multipart { upload_id, initial_urls, .. } => {
+                        BatchWorkItem::Multipart { upload_id, part_size, initial_urls, .. } => {
                             upload_multipart_to_r2(
-                                path, &upload_id, &r2_key, file_info.size, initial_urls,
+                                path, &upload_id, &r2_key, file_info.size, part_size, initial_urls,
                                 &file_info.file_id, &file_info.filename, &progress,
                                 Some(coll_id.clone()), Some(coll_name.clone()),
                             ).await
@@ -957,6 +964,7 @@ async fn upload_folder(
         size: total_size,
         is_collection: true,
         file_count: Some(success_count),
+        attempted_count: Some(file_infos.len() as u32),
     };
 
     // Apply default expiry if configured (0 = permanent, skip)

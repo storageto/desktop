@@ -9,7 +9,10 @@ use std::path::Path;
 use tauri::ipc::Channel;
 use uuid::Uuid;
 
-const CHUNK_SIZE: u64 = 32 * 1024 * 1024; // 32MB chunks (matches API PART_SIZE)
+// Fallback chunk size, used ONLY when the API did not send a part_size (an
+// older deployment). It is not a mirror of the server value and must never be
+// used to slice a session the server sized - see upload_multipart_v2.
+const CHUNK_SIZE: u64 = 32 * 1024 * 1024;
 const BATCH_SIZE: usize = 250; // Max files per batch API call
 
 // Debug logging to file
@@ -47,7 +50,12 @@ pub struct UploadResult {
     pub filename: String,
     pub size: u64,
     pub is_collection: bool,
+    /// Files that actually landed.
     pub file_count: Option<u32>,
+    /// Files the user asked for. Only the Rust side knows this for a folder -
+    /// the frontend hands over one path and gets a count back - so a shortfall
+    /// is invisible to the UI and to analytics unless it travels here.
+    pub attempted_count: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,7 +70,6 @@ struct InitUploadResponse {
     headers: Option<std::collections::HashMap<String, Vec<String>>>,
     // Multipart fields
     upload_id: Option<String>,
-    #[allow(dead_code)]
     part_size: Option<i64>,
     #[allow(dead_code)]
     total_parts: Option<i32>,
@@ -153,6 +160,9 @@ pub struct InitBatchResult {
     pub upload_type: Option<String>,
     // Multipart fields (for large files)
     pub upload_id: Option<String>,
+    /// The chunk size the server minted this session with. Slicing on a local
+    /// copy instead of this is one edit away from silently misaligned parts.
+    pub part_size: Option<i64>,
     pub initial_urls: Option<std::collections::HashMap<String, String>>,
     // Error handling
     #[allow(dead_code)]
@@ -406,11 +416,13 @@ pub async fn upload_to_r2(
 }
 
 /// Upload a large file to R2 using multipart upload (no init/confirm API calls, just R2 parts + complete)
+#[allow(clippy::too_many_arguments)]
 pub async fn upload_multipart_to_r2(
     path: &Path,
     upload_id: &str,
     r2_key: &str,
     size: u64,
+    server_part_size: Option<i64>,
     initial_urls: std::collections::HashMap<String, String>,
     file_id: &str,
     filename: &str,
@@ -425,6 +437,7 @@ pub async fn upload_multipart_to_r2(
         upload_id,
         r2_key,
         size,
+        server_part_size,
         initial_urls,
         file_id,
         filename,
@@ -552,6 +565,7 @@ pub async fn upload_file(
             &upload_id,
             &r2_key,
             size,
+            init_data.part_size,
             initial_urls,
             &file_id,
             &filename,
@@ -656,6 +670,7 @@ pub async fn upload_file(
         size,
         is_collection: false,
         file_count: None,
+        attempted_count: None,
     })
 }
 
@@ -754,6 +769,7 @@ async fn upload_single(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn upload_multipart_v2(
     client: &Client,
     api_url: &str,
@@ -761,6 +777,12 @@ async fn upload_multipart_v2(
     upload_id: &str,
     _r2_key: &str,
     total_size: u64,
+    // The chunk size the SERVER minted this session with. It has to come from
+    // the init response, not from CHUNK_SIZE: the server decides where every
+    // part boundary falls, and slicing on a local copy that happens to match is
+    // one edit away from silently misaligned parts. None means the server did
+    // not say (an older API), and only then do we fall back.
+    server_part_size: Option<i64>,
     initial_urls: std::collections::HashMap<String, String>,
     file_id: &str,
     filename: &str,
@@ -773,6 +795,13 @@ async fn upload_multipart_v2(
 
     const MAX_CONCURRENT: usize = 4;
     const MAX_RETRIES: u32 = 3;
+
+    // The server's value wins. CHUNK_SIZE is the floor under an API too old to
+    // send one, never the working number.
+    let chunk_size: u64 = match server_part_size {
+        Some(n) if n > 0 => n as u64,
+        _ => CHUNK_SIZE,
+    };
 
     let mut file = tokio::fs::File::open(path)
         .await
@@ -789,8 +818,8 @@ async fn upload_multipart_v2(
 
         // Pre-read up to MAX_CONCURRENT parts from disk
         for _ in 0..MAX_CONCURRENT {
-            let part_start = (part_number as u64 - 1) * CHUNK_SIZE;
-            let part_size = std::cmp::min(CHUNK_SIZE, total_size.saturating_sub(part_start)) as usize;
+            let part_start = (part_number as u64 - 1) * chunk_size;
+            let part_size = std::cmp::min(chunk_size, total_size.saturating_sub(part_start)) as usize;
 
             if part_size == 0 {
                 break;
