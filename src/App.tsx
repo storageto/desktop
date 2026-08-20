@@ -338,9 +338,17 @@ function App() {
 
           // Success - was a folder
           await copyToClipboard(result.url);
+          // A shortfall has to be in the headline. Saying "382 files uploaded"
+          // when 425 were asked for is how 43 missing files stayed unnoticed
+          // until a customer counted them by hand.
+          const landed = result.file_count ?? 0;
+          const asked = result.attempted_count ?? landed;
+          const short = asked - landed;
           await showNotification(
-            "Collection uploaded",
-            `${result.file_count} files uploaded - URL copied!`
+            short > 0 ? "Collection uploaded, some files failed" : "Collection uploaded",
+            short > 0
+              ? `${landed} of ${asked} files uploaded, ${short} failed - URL copied!`
+              : `${landed} files uploaded - URL copied!`
           );
 
           // Track analytics
@@ -353,9 +361,12 @@ function App() {
             isCollection: true,
           });
 
-          // Refresh history first, then clear uploads so file doesn't vanish
+          // Refresh history first, then clear uploads so file doesn't vanish.
+          // Failed rows STAY: they carry the only per-file reason the user ever
+          // sees, and clearing them the instant the collection finishes threw
+          // that away at exactly the moment it was worth reading.
           await fetchHistory(searchQuery.trim() || null);
-          setUploads([]);
+          setUploads((prev) => prev.filter((u) => u.status === "error"));
           bumpLimits();
           await maybeShowQrOnComplete(result.url, result.filename);
           return;
@@ -383,9 +394,15 @@ function App() {
           await showNotification("Upload complete", `${lastResult.filename} - URL copied!`);
         } else {
           const count = lastResult.file_count || fileResults.length;
+          // Same rule as the folder path: a shortfall belongs in the headline,
+          // not only in the rows behind it.
+          const asked = lastResult.attempted_count ?? paths.length;
+          const short = asked - count;
           await showNotification(
-            "Uploads complete",
-            `${count} files uploaded - URL copied!`
+            short > 0 ? "Uploads complete, some files failed" : "Uploads complete",
+            short > 0
+              ? `${count} of ${asked} files uploaded, ${short} failed - URL copied!`
+              : `${count} files uploaded - URL copied!`
           );
         }
 
@@ -400,9 +417,10 @@ function App() {
           isCollection: lastResult.is_collection,
         });
 
-        // Refresh history — server generates thumbnails async, will appear on next focus
+        // Refresh history — server generates thumbnails async, will appear on next focus.
+        // Failed rows stay, so their reasons survive the success.
         await fetchHistory(searchQuery.trim() || null);
-        setUploads([]);
+        setUploads((prev) => prev.filter((u) => u.status === "error"));
         bumpLimits();
         await maybeShowQrOnComplete(lastResult.url, lastResult.filename);
       }

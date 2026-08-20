@@ -544,7 +544,10 @@ function CollectionUploadItem({ group }: { group: CollectionUploadGroup }) {
                   file could only ever say "failed" - which is how 43 files
                   refused by the concurrency wall read as an app glitch. */}
               {file.status === "error" && file.error && (
-                <span className="text-[10px] text-red-400/70 truncate max-w-[45%] flex-shrink-0">
+                <span
+                  className="text-[10px] text-red-400/70 truncate max-w-[45%] flex-shrink-0"
+                  title={file.error}
+                >
                   {file.error}
                 </span>
               )}

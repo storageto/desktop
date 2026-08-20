@@ -120,8 +120,8 @@ enum BatchWorkItem {
         idx: usize,
         file_info: FileInfo,
         upload_id: String,
-        /// The server's chunk size for THIS session, carried rather than
-        /// re-derived: the server decides where every part boundary falls.
+        /// The part size the server minted THIS session with, carried rather
+        /// than re-derived so the client's part count matches the server's.
         part_size: Option<i64>,
         initial_urls: std::collections::HashMap<String, String>,
         r2_key: String,
@@ -269,7 +269,26 @@ async fn upload_files_batch(
         // Build work items with init results
         for (idx, file_info) in batch.iter().enumerate() {
             let idx_str = idx.to_string();
-            if let Some(init_result) = init_results.get(&idx_str) {
+            let Some(init_result) = init_results.get(&idx_str) else {
+                // The server answered the batch but said nothing about this
+                // element. Theoretical today - the server writes every index -
+                // but it is the same silent shortfall a refusal used to be, so
+                // it gets the same treatment rather than vanishing.
+                eprintln!("[Batch] No init result for {}", file_info.filename);
+                let _ = on_progress.send(UploadProgress {
+                    file_id: file_info.file_id.clone(),
+                    filename: file_info.filename.clone(),
+                    bytes_uploaded: 0,
+                    total_bytes: file_info.size,
+                    percentage: 0.0,
+                    status: "error".to_string(),
+                    collection_id: Some(collection_id_for_progress.clone()),
+                    collection_name: Some(collection_name.clone()),
+                    error: Some("The server did not answer for this file.".to_string()),
+                });
+                continue;
+            };
+            {
                 let fi = FileInfo {
                     path: file_info.path.clone(),
                     filename: file_info.filename.clone(),
@@ -473,6 +492,36 @@ async fn upload_files_batch(
 
             // Process confirm results
             for (idx_str, result) in confirm_results {
+                // A file whose bytes reached R2 but whose record was refused
+                // (blocked extension, blocked hash, key already claimed) used
+                // to fall out of this loop with nothing said: no event, so its
+                // row sat on "confirming" forever and the collection was short.
+                // Same silent shortfall as a refused init, one step later.
+                if !result.success || result.file.is_none() {
+                    let name = idx_str
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|i| batch_uploaded.get(i))
+                        .map(|(n, _): &(String, u64)| n.clone())
+                        .unwrap_or_else(|| "This file".to_string());
+                    let reason = result
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "The server would not save this file.".to_string());
+                    eprintln!("[Batch] Refused on confirm: {} - {}", name, reason);
+                    let _ = on_progress.send(UploadProgress {
+                        file_id: Uuid::new_v4().to_string(),
+                        filename: name,
+                        bytes_uploaded: 0,
+                        total_bytes: 0,
+                        percentage: 0.0,
+                        status: "error".to_string(),
+                        collection_id: Some(collection_id_for_progress.clone()),
+                        collection_name: Some(collection_name.clone()),
+                        error: Some(reason),
+                    });
+                    continue;
+                }
                 if result.success {
                     if let Some(file) = result.file {
                         if let Ok(idx) = idx_str.parse::<usize>() {
@@ -687,7 +736,26 @@ async fn upload_folder(
 
         for (idx, file_info) in batch.iter().enumerate() {
             let idx_str = idx.to_string();
-            if let Some(init_result) = init_results.get(&idx_str) {
+            let Some(init_result) = init_results.get(&idx_str) else {
+                // The server answered the batch but said nothing about this
+                // element. Theoretical today - the server writes every index -
+                // but it is the same silent shortfall a refusal used to be, so
+                // it gets the same treatment rather than vanishing.
+                eprintln!("[Batch] No init result for {}", file_info.filename);
+                let _ = on_progress.send(UploadProgress {
+                    file_id: file_info.file_id.clone(),
+                    filename: file_info.filename.clone(),
+                    bytes_uploaded: 0,
+                    total_bytes: file_info.size,
+                    percentage: 0.0,
+                    status: "error".to_string(),
+                    collection_id: Some(collection_id_for_progress.clone()),
+                    collection_name: Some(folder_name.clone()),
+                    error: Some("The server did not answer for this file.".to_string()),
+                });
+                continue;
+            };
+            {
                 let fi = FileInfo {
                     path: file_info.path.clone(),
                     filename: file_info.filename.clone(),
@@ -885,6 +953,36 @@ async fn upload_folder(
             let confirm_results = confirm_batch(Some(collection_id.clone()), uploaded_files).await?;
 
             for (idx_str, result) in confirm_results {
+                // A file whose bytes reached R2 but whose record was refused
+                // (blocked extension, blocked hash, key already claimed) used
+                // to fall out of this loop with nothing said: no event, so its
+                // row sat on "confirming" forever and the collection was short.
+                // Same silent shortfall as a refused init, one step later.
+                if !result.success || result.file.is_none() {
+                    let name = idx_str
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|i| batch_uploaded.get(i))
+                        .map(|(n, _): &(String, u64)| n.clone())
+                        .unwrap_or_else(|| "This file".to_string());
+                    let reason = result
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "The server would not save this file.".to_string());
+                    eprintln!("[Batch] Refused on confirm: {} - {}", name, reason);
+                    let _ = on_progress.send(UploadProgress {
+                        file_id: Uuid::new_v4().to_string(),
+                        filename: name,
+                        bytes_uploaded: 0,
+                        total_bytes: 0,
+                        percentage: 0.0,
+                        status: "error".to_string(),
+                        collection_id: Some(collection_id_for_progress.clone()),
+                        collection_name: Some(folder_name.clone()),
+                        error: Some(reason),
+                    });
+                    continue;
+                }
                 if result.success {
                     if let Some(file) = result.file {
                         if let Ok(idx) = idx_str.parse::<usize>() {

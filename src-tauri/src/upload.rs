@@ -9,11 +9,14 @@ use std::path::Path;
 use tauri::ipc::Channel;
 use uuid::Uuid;
 
-// Fallback chunk size, used ONLY when the API did not send a part_size (an
-// older deployment). It is not a mirror of the server value and must never be
-// used to slice a session the server sized - see upload_multipart_v2.
+// Fallback part size, used ONLY when the API did not send a part_size (an
+// older deployment). Not a mirror of the server's value: see upload_multipart_v2
+// for why the server's wins when it is offered.
 const CHUNK_SIZE: u64 = 32 * 1024 * 1024;
 const BATCH_SIZE: usize = 250; // Max files per batch API call
+/// How many part URLs to fetch per /api/upload/parts call, matching the number
+/// init mints up front (INIT_URL_BATCH_SIZE server-side).
+const PART_URL_WINDOW: u32 = 250;
 
 // Debug logging to file
 fn debug_log(msg: &str) {
@@ -195,7 +198,6 @@ struct ConfirmBatchResponse {
 pub struct ConfirmBatchResult {
     pub success: bool,
     pub file: Option<BatchConfirmedFile>,
-    #[allow(dead_code)]
     pub error: Option<String>,
 }
 
@@ -777,11 +779,15 @@ async fn upload_multipart_v2(
     upload_id: &str,
     _r2_key: &str,
     total_size: u64,
-    // The chunk size the SERVER minted this session with. It has to come from
-    // the init response, not from CHUNK_SIZE: the server decides where every
-    // part boundary falls, and slicing on a local copy that happens to match is
-    // one edit away from silently misaligned parts. None means the server did
-    // not say (an older API), and only then do we fall back.
+    // The part size the server minted this session with, from the init response.
+    //
+    // R2 stores whatever bytes each presigned part PUT carries and assembles by
+    // part number, so a client/server mismatch does not misplace bytes. What it
+    // does break is the part COUNT: slice a 40GB file at 32MB when the server
+    // said 64MB and you need 1,250 parts instead of 625, which walks into S3's
+    // 10,000-part limit sooner and, more immediately, past the 250 URLs init
+    // mints. Following the server keeps those in step. None means an API older
+    // than this client, and only then do we fall back.
     server_part_size: Option<i64>,
     initial_urls: std::collections::HashMap<String, String>,
     file_id: &str,
@@ -796,10 +802,17 @@ async fn upload_multipart_v2(
     const MAX_CONCURRENT: usize = 4;
     const MAX_RETRIES: u32 = 3;
 
-    // The server's value wins. CHUNK_SIZE is the floor under an API too old to
-    // send one, never the working number.
+    // The server's value wins, inside sane bounds. Unclamped it is a remote
+    // input controlling an allocation: MAX_CONCURRENT parts are pre-read into
+    // memory and each retry clones one, so peak RAM is about 8x this number.
+    // The floor is S3's own rule - a non-final part under 5MiB is rejected
+    // with EntityTooSmall - and the ceiling keeps a mistake at the API from
+    // turning into an OOM on someone's laptop.
+    const MIN_PART: u64 = 5 * 1024 * 1024;
+    const MAX_PART: u64 = 128 * 1024 * 1024;
     let chunk_size: u64 = match server_part_size {
-        Some(n) if n > 0 => n as u64,
+        Some(n) if n > 0 => (n as u64).clamp(MIN_PART, MAX_PART),
+        // No part_size in the response: an API older than this client.
         _ => CHUNK_SIZE,
     };
 
@@ -836,7 +849,10 @@ async fn upload_multipart_v2(
             let part_url = match part_urls.get(&part_key) {
                 Some(url) => url.clone(),
                 None => {
-                    let more_urls = get_more_parts_v2(client, api_url, upload_id, part_number).await?;
+                    // Ask for a window of URLs, not just this one: the round
+                    // trip is the expensive part, and 250 is what init mints.
+                    let more_urls =
+                        get_more_parts_v2(client, api_url, upload_id, part_number, PART_URL_WINDOW).await?;
                     part_urls.extend(more_urls);
                     part_urls.get(&part_key)
                         .ok_or_else(|| format!("Missing URL for part {}", part_number))?
@@ -1038,28 +1054,49 @@ async fn upload_part_with_retry(
     Err(format!("Part {} upload failed after {} attempts", part_number, max_retries))
 }
 
+/// Fetch presigned URLs for the next window of parts.
+///
+/// The request and response shapes here were BOTH wrong, and had been since
+/// this function was written: it sent `{start_part, count}` and read
+/// `part_urls`, while POST /api/upload/parts requires `part_numbers` (an
+/// explicit array) and answers `{success, urls}`. The server replied 422 "The
+/// part numbers field is required." and the whole file died.
+///
+/// Init only ever hands out the first INIT_URL_BATCH_SIZE (250) part URLs, so
+/// this is the ONLY way to reach part 251 onward. At a 32MB part size that put
+/// a hard ceiling at ~7.8GB on every desktop upload, against a plan limit of
+/// 100GB - and the ceiling was invisible, because it looked like one file
+/// failing rather than a size limit. Prod bears it out: the largest file ever
+/// uploaded from the desktop app is 4.95GB, while web has done 37.8GB.
+///
+/// The Go CLI has always sent the right shape (cli/internal/api/client.go),
+/// which is why this survived: nothing else spoke this dialect.
 async fn get_more_parts_v2(
     client: &Client,
     api_url: &str,
     upload_id: &str,
     start_part: u32,
+    count: u32,
 ) -> Result<std::collections::HashMap<String, String>, String> {
     #[derive(Serialize)]
     struct GetPartsRequest {
         upload_id: String,
-        start_part: u32,
-        count: u32,
+        part_numbers: Vec<u32>,
     }
 
     #[derive(Deserialize)]
     struct GetPartsResponse {
-        part_urls: std::collections::HashMap<String, String>,
+        #[serde(default)]
+        success: Option<bool>,
+        #[serde(default)]
+        urls: std::collections::HashMap<String, String>,
+        #[serde(default)]
+        error: Option<String>,
     }
 
     let request = GetPartsRequest {
         upload_id: upload_id.to_string(),
-        start_part,
-        count: 250,
+        part_numbers: (start_part..start_part + count).collect(),
     };
 
     let response = client
@@ -1070,16 +1107,28 @@ async fn get_more_parts_v2(
         .await
         .map_err(|e| format!("Failed to get part URLs: {}", e))?;
 
-    if !response.status().is_success() {
-        return Err("Failed to get more part URLs".to_string());
+    // Carry the server's own words. "Failed to get more part URLs" is what made
+    // the 422 above unreadable for as long as it shipped.
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read parts response: {}", e))?;
+
+    if !status.is_success() {
+        return Err(format!("Could not get upload URLs (HTTP {}): {}", status.as_u16(), body));
     }
 
-    let data: GetPartsResponse = response
-        .json()
-        .await
+    let data: GetPartsResponse = serde_json::from_str(&body)
         .map_err(|e| format!("Failed to parse parts response: {}", e))?;
 
-    Ok(data.part_urls)
+    // A 200 carrying {"success":false} is how this route reports an upload that
+    // is no longer active or has expired - not an HTTP error.
+    if data.success == Some(false) {
+        return Err(data.error.unwrap_or_else(|| "Upload session is no longer active.".to_string()));
+    }
+
+    Ok(data.urls)
 }
 
 pub async fn create_collection(expected_file_count: Option<usize>) -> Result<CollectionInfo, String> {
