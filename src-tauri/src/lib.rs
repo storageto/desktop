@@ -213,6 +213,7 @@ async fn upload_files_batch(
             status: "queued".to_string(),
             collection_id: Some(temp_collection_id.clone()),
             collection_name: Some(collection_name.clone()),
+            error: None,
         });
 
         file_infos.push(FileInfo {
@@ -284,7 +285,30 @@ async fn upload_files_batch(
                         r2_key: r2_key.clone(),
                     }).await;
                 } else {
-                    eprintln!("[Batch] Missing URL/key for file {}: {:?}", idx, init_result.error);
+                    // The server refused this file (concurrency wall, blocked
+                    // extension, size ceiling...). It used to be dropped here
+                    // with nothing but a line on stderr: no progress event, so
+                    // the row never left "queued", the success tally never
+                    // counted it, and the finished collection was quietly short.
+                    // A 425-file folder landed as 382 that way on 2026-08-19 and
+                    // the app called it a success. A refusal is a failure and
+                    // has to look like one.
+                    let reason = init_result
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "The server rejected this file.".to_string());
+                    eprintln!("[Batch] Refused by server: {} - {}", file_info.filename, reason);
+                    let _ = on_progress.send(UploadProgress {
+                        file_id: file_info.file_id.clone(),
+                        filename: file_info.filename.clone(),
+                        bytes_uploaded: 0,
+                        total_bytes: file_info.size,
+                        percentage: 0.0,
+                        status: "error".to_string(),
+                        collection_id: Some(collection_id_for_progress.clone()),
+                        collection_name: Some(collection_name.clone()),
+                        error: Some(reason),
+                    });
                 }
             }
         }
@@ -345,6 +369,7 @@ async fn upload_files_batch(
                             status: "cancelled".to_string(),
                             collection_id: Some(coll_id.clone()),
                             collection_name: Some(coll_name.clone()),
+                            error: None,
                         });
                         break;
                     }
@@ -361,6 +386,7 @@ async fn upload_files_batch(
                         status: "uploading".to_string(),
                         collection_id: Some(coll_id.clone()),
                         collection_name: Some(coll_name.clone()),
+                        error: None,
                     });
 
                     // Upload to R2 (single or multipart)
@@ -392,6 +418,7 @@ async fn upload_files_batch(
                                 status: "confirming".to_string(),
                                 collection_id: Some(coll_id.clone()),
                                 collection_name: Some(coll_name.clone()),
+                                error: None,
                             });
                             uploaded.push((idx, file_info.filename, file_info.content_type, r2_key, file_info.size));
                         }
@@ -406,6 +433,7 @@ async fn upload_files_batch(
                                 status: "error".to_string(),
                                 collection_id: Some(coll_id.clone()),
                                 collection_name: Some(coll_name.clone()),
+                                error: None,
                             });
                         }
                     }
@@ -518,6 +546,7 @@ async fn upload_files_batch(
                 status: "complete".to_string(),
                 collection_id: Some(collection_id.clone()),
                 collection_name: Some(collection_name.clone()),
+                error: None,
             });
         }
     }
@@ -601,6 +630,7 @@ async fn upload_folder(
             status: "queued".to_string(),
             collection_id: Some(temp_collection_id.clone()),
             collection_name: Some(folder_name.clone()),
+            error: None,
         });
 
         file_infos.push(FileInfo {
@@ -670,7 +700,30 @@ async fn upload_folder(
                         r2_key: r2_key.clone(),
                     }).await;
                 } else {
-                    eprintln!("[Batch] Missing URL/key for file {}: {:?}", idx, init_result.error);
+                    // The server refused this file (concurrency wall, blocked
+                    // extension, size ceiling...). It used to be dropped here
+                    // with nothing but a line on stderr: no progress event, so
+                    // the row never left "queued", the success tally never
+                    // counted it, and the finished collection was quietly short.
+                    // A 425-file folder landed as 382 that way on 2026-08-19 and
+                    // the app called it a success. A refusal is a failure and
+                    // has to look like one.
+                    let reason = init_result
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "The server rejected this file.".to_string());
+                    eprintln!("[Batch] Refused by server: {} - {}", file_info.filename, reason);
+                    let _ = on_progress.send(UploadProgress {
+                        file_id: file_info.file_id.clone(),
+                        filename: file_info.filename.clone(),
+                        bytes_uploaded: 0,
+                        total_bytes: file_info.size,
+                        percentage: 0.0,
+                        status: "error".to_string(),
+                        collection_id: Some(collection_id_for_progress.clone()),
+                        collection_name: Some(folder_name.clone()),
+                        error: Some(reason),
+                    });
                 }
             }
         }
@@ -728,6 +781,7 @@ async fn upload_folder(
                             status: "cancelled".to_string(),
                             collection_id: Some(coll_id.clone()),
                             collection_name: Some(coll_name.clone()),
+                            error: None,
                         });
                         break;
                     }
@@ -743,6 +797,7 @@ async fn upload_folder(
                         status: "uploading".to_string(),
                         collection_id: Some(coll_id.clone()),
                         collection_name: Some(coll_name.clone()),
+                        error: None,
                     });
 
                     let upload_result = match item {
@@ -773,6 +828,7 @@ async fn upload_folder(
                                 status: "confirming".to_string(),
                                 collection_id: Some(coll_id.clone()),
                                 collection_name: Some(coll_name.clone()),
+                                error: None,
                             });
                             uploaded.push((idx, file_info.filename, file_info.content_type, r2_key, file_info.size));
                         }
@@ -787,6 +843,7 @@ async fn upload_folder(
                                 status: "error".to_string(),
                                 collection_id: Some(coll_id.clone()),
                                 collection_name: Some(coll_name.clone()),
+                                error: None,
                             });
                         }
                     }
@@ -889,6 +946,7 @@ async fn upload_folder(
                 status: "complete".to_string(),
                 collection_id: Some(collection_id.clone()),
                 collection_name: Some(folder_name.clone()),
+                error: None,
             });
         }
     }

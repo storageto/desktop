@@ -24,6 +24,8 @@ interface UploadProgress {
   status: string;
   collection_id?: string;
   collection_name?: string;
+  /** Set when the server refused the file, so the row can say why. */
+  error?: string;
 }
 
 interface UploadResult {
@@ -306,6 +308,7 @@ function App() {
         status: progress.status as UploadItem["status"],
         collectionId: progress.collection_id,
         collectionName: progress.collection_name,
+        error: progress.error,
       };
 
       const existing = prev.find((u) => u.id === progress.file_id);

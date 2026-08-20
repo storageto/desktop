@@ -35,6 +35,10 @@ pub struct UploadProgress {
     pub status: String,
     pub collection_id: Option<String>,
     pub collection_name: Option<String>,
+    /// Why this file failed, when the server told us. Serialized as `error`;
+    /// the UI shows it on the row instead of a bare "failed".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -464,6 +468,7 @@ pub async fn upload_file(
         status: "initializing".to_string(),
         collection_id: None,
         collection_name: None,
+        error: None,
     });
 
     let client = get_client();
@@ -532,6 +537,7 @@ pub async fn upload_file(
         status: "uploading".to_string(),
         collection_id: None,
         collection_name: None,
+        error: None,
     });
 
     if upload_type == "multipart" {
@@ -570,6 +576,7 @@ pub async fn upload_file(
         status: "confirming".to_string(),
         collection_id: None,
         collection_name: None,
+        error: None,
     });
 
     let confirm_request = ConfirmUploadRequest {
@@ -640,6 +647,7 @@ pub async fn upload_file(
         status: "complete".to_string(),
         collection_id: None,
         collection_name: None,
+        error: None,
     });
 
     Ok(UploadResult {
@@ -700,6 +708,7 @@ async fn upload_single(
                         status: "uploading".to_string(),
                         collection_id: coll_id.clone(),
                         collection_name: coll_name.clone(),
+                        error: None,
                     });
 
                     yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&buffer[..n]));
@@ -942,6 +951,7 @@ async fn upload_part_with_retry(
                     status: "uploading".to_string(),
                     collection_id: p_coll_id.clone(),
                     collection_name: p_coll_name.clone(),
+                    error: None,
                 });
 
                 yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(chunk));
