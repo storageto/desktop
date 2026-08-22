@@ -120,6 +120,9 @@ enum BatchWorkItem {
         idx: usize,
         file_info: FileInfo,
         upload_id: String,
+        /// The part size the server minted THIS session with, carried rather
+        /// than re-derived so the client's part count matches the server's.
+        part_size: Option<i64>,
         initial_urls: std::collections::HashMap<String, String>,
         r2_key: String,
     },
@@ -213,6 +216,7 @@ async fn upload_files_batch(
             status: "queued".to_string(),
             collection_id: Some(temp_collection_id.clone()),
             collection_name: Some(collection_name.clone()),
+            error: None,
         });
 
         file_infos.push(FileInfo {
@@ -265,7 +269,26 @@ async fn upload_files_batch(
         // Build work items with init results
         for (idx, file_info) in batch.iter().enumerate() {
             let idx_str = idx.to_string();
-            if let Some(init_result) = init_results.get(&idx_str) {
+            let Some(init_result) = init_results.get(&idx_str) else {
+                // The server answered the batch but said nothing about this
+                // element. Theoretical today - the server writes every index -
+                // but it is the same silent shortfall a refusal used to be, so
+                // it gets the same treatment rather than vanishing.
+                eprintln!("[Batch] No init result for {}", file_info.filename);
+                let _ = on_progress.send(UploadProgress {
+                    file_id: file_info.file_id.clone(),
+                    filename: file_info.filename.clone(),
+                    bytes_uploaded: 0,
+                    total_bytes: file_info.size,
+                    percentage: 0.0,
+                    status: "error".to_string(),
+                    collection_id: Some(collection_id_for_progress.clone()),
+                    collection_name: Some(collection_name.clone()),
+                    error: Some("The server did not answer for this file.".to_string()),
+                });
+                continue;
+            };
+            {
                 let fi = FileInfo {
                     path: file_info.path.clone(),
                     filename: file_info.filename.clone(),
@@ -280,11 +303,35 @@ async fn upload_files_batch(
                 } else if let (Some(upload_id), Some(r2_key)) = (&init_result.upload_id, &init_result.r2_key) {
                     let _ = tx.send(BatchWorkItem::Multipart {
                         idx, file_info: fi, upload_id: upload_id.clone(),
+                        part_size: init_result.part_size,
                         initial_urls: init_result.initial_urls.clone().unwrap_or_default(),
                         r2_key: r2_key.clone(),
                     }).await;
                 } else {
-                    eprintln!("[Batch] Missing URL/key for file {}: {:?}", idx, init_result.error);
+                    // The server refused this file (concurrency wall, blocked
+                    // extension, size ceiling...). It used to be dropped here
+                    // with nothing but a line on stderr: no progress event, so
+                    // the row never left "queued", the success tally never
+                    // counted it, and the finished collection was quietly short.
+                    // A 425-file folder landed as 382 that way on 2026-08-19 and
+                    // the app called it a success. A refusal is a failure and
+                    // has to look like one.
+                    let reason = init_result
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "The server rejected this file.".to_string());
+                    eprintln!("[Batch] Refused by server: {} - {}", file_info.filename, reason);
+                    let _ = on_progress.send(UploadProgress {
+                        file_id: file_info.file_id.clone(),
+                        filename: file_info.filename.clone(),
+                        bytes_uploaded: 0,
+                        total_bytes: file_info.size,
+                        percentage: 0.0,
+                        status: "error".to_string(),
+                        collection_id: Some(collection_id_for_progress.clone()),
+                        collection_name: Some(collection_name.clone()),
+                        error: Some(reason),
+                    });
                 }
             }
         }
@@ -345,6 +392,7 @@ async fn upload_files_batch(
                             status: "cancelled".to_string(),
                             collection_id: Some(coll_id.clone()),
                             collection_name: Some(coll_name.clone()),
+                            error: None,
                         });
                         break;
                     }
@@ -361,6 +409,7 @@ async fn upload_files_batch(
                         status: "uploading".to_string(),
                         collection_id: Some(coll_id.clone()),
                         collection_name: Some(coll_name.clone()),
+                        error: None,
                     });
 
                     // Upload to R2 (single or multipart)
@@ -372,9 +421,9 @@ async fn upload_files_batch(
                                 &progress, Some(coll_id.clone()), Some(coll_name.clone()),
                             ).await
                         }
-                        BatchWorkItem::Multipart { upload_id, initial_urls, .. } => {
+                        BatchWorkItem::Multipart { upload_id, part_size, initial_urls, .. } => {
                             upload_multipart_to_r2(
-                                path, &upload_id, &r2_key, file_info.size, initial_urls,
+                                path, &upload_id, &r2_key, file_info.size, part_size, initial_urls,
                                 &file_info.file_id, &file_info.filename, &progress,
                                 Some(coll_id.clone()), Some(coll_name.clone()),
                             ).await
@@ -392,6 +441,7 @@ async fn upload_files_batch(
                                 status: "confirming".to_string(),
                                 collection_id: Some(coll_id.clone()),
                                 collection_name: Some(coll_name.clone()),
+                                error: None,
                             });
                             uploaded.push((idx, file_info.filename, file_info.content_type, r2_key, file_info.size));
                         }
@@ -406,6 +456,7 @@ async fn upload_files_batch(
                                 status: "error".to_string(),
                                 collection_id: Some(coll_id.clone()),
                                 collection_name: Some(coll_name.clone()),
+                                error: None,
                             });
                         }
                     }
@@ -441,6 +492,36 @@ async fn upload_files_batch(
 
             // Process confirm results
             for (idx_str, result) in confirm_results {
+                // A file whose bytes reached R2 but whose record was refused
+                // (blocked extension, blocked hash, key already claimed) used
+                // to fall out of this loop with nothing said: no event, so its
+                // row sat on "confirming" forever and the collection was short.
+                // Same silent shortfall as a refused init, one step later.
+                if !result.success || result.file.is_none() {
+                    let name = idx_str
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|i| batch_uploaded.get(i))
+                        .map(|(n, _): &(String, u64)| n.clone())
+                        .unwrap_or_else(|| "This file".to_string());
+                    let reason = result
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "The server would not save this file.".to_string());
+                    eprintln!("[Batch] Refused on confirm: {} - {}", name, reason);
+                    let _ = on_progress.send(UploadProgress {
+                        file_id: Uuid::new_v4().to_string(),
+                        filename: name,
+                        bytes_uploaded: 0,
+                        total_bytes: 0,
+                        percentage: 0.0,
+                        status: "error".to_string(),
+                        collection_id: Some(collection_id_for_progress.clone()),
+                        collection_name: Some(collection_name.clone()),
+                        error: Some(reason),
+                    });
+                    continue;
+                }
                 if result.success {
                     if let Some(file) = result.file {
                         if let Ok(idx) = idx_str.parse::<usize>() {
@@ -461,6 +542,7 @@ async fn upload_files_batch(
                                     size: *size,
                                     is_collection: false,
                                     file_count: None,
+                                    attempted_count: None,
                                 });
                             }
                         }
@@ -518,6 +600,7 @@ async fn upload_files_batch(
                 status: "complete".to_string(),
                 collection_id: Some(collection_id.clone()),
                 collection_name: Some(collection_name.clone()),
+                error: None,
             });
         }
     }
@@ -529,6 +612,7 @@ async fn upload_files_batch(
         size: total_size,
         is_collection: true,
         file_count: Some(file_count),
+        attempted_count: Some(file_infos.len() as u32),
     });
 
     Ok(all_results)
@@ -601,6 +685,7 @@ async fn upload_folder(
             status: "queued".to_string(),
             collection_id: Some(temp_collection_id.clone()),
             collection_name: Some(folder_name.clone()),
+            error: None,
         });
 
         file_infos.push(FileInfo {
@@ -651,7 +736,26 @@ async fn upload_folder(
 
         for (idx, file_info) in batch.iter().enumerate() {
             let idx_str = idx.to_string();
-            if let Some(init_result) = init_results.get(&idx_str) {
+            let Some(init_result) = init_results.get(&idx_str) else {
+                // The server answered the batch but said nothing about this
+                // element. Theoretical today - the server writes every index -
+                // but it is the same silent shortfall a refusal used to be, so
+                // it gets the same treatment rather than vanishing.
+                eprintln!("[Batch] No init result for {}", file_info.filename);
+                let _ = on_progress.send(UploadProgress {
+                    file_id: file_info.file_id.clone(),
+                    filename: file_info.filename.clone(),
+                    bytes_uploaded: 0,
+                    total_bytes: file_info.size,
+                    percentage: 0.0,
+                    status: "error".to_string(),
+                    collection_id: Some(collection_id_for_progress.clone()),
+                    collection_name: Some(folder_name.clone()),
+                    error: Some("The server did not answer for this file.".to_string()),
+                });
+                continue;
+            };
+            {
                 let fi = FileInfo {
                     path: file_info.path.clone(),
                     filename: file_info.filename.clone(),
@@ -666,11 +770,35 @@ async fn upload_folder(
                 } else if let (Some(upload_id), Some(r2_key)) = (&init_result.upload_id, &init_result.r2_key) {
                     let _ = tx.send(BatchWorkItem::Multipart {
                         idx, file_info: fi, upload_id: upload_id.clone(),
+                        part_size: init_result.part_size,
                         initial_urls: init_result.initial_urls.clone().unwrap_or_default(),
                         r2_key: r2_key.clone(),
                     }).await;
                 } else {
-                    eprintln!("[Batch] Missing URL/key for file {}: {:?}", idx, init_result.error);
+                    // The server refused this file (concurrency wall, blocked
+                    // extension, size ceiling...). It used to be dropped here
+                    // with nothing but a line on stderr: no progress event, so
+                    // the row never left "queued", the success tally never
+                    // counted it, and the finished collection was quietly short.
+                    // A 425-file folder landed as 382 that way on 2026-08-19 and
+                    // the app called it a success. A refusal is a failure and
+                    // has to look like one.
+                    let reason = init_result
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "The server rejected this file.".to_string());
+                    eprintln!("[Batch] Refused by server: {} - {}", file_info.filename, reason);
+                    let _ = on_progress.send(UploadProgress {
+                        file_id: file_info.file_id.clone(),
+                        filename: file_info.filename.clone(),
+                        bytes_uploaded: 0,
+                        total_bytes: file_info.size,
+                        percentage: 0.0,
+                        status: "error".to_string(),
+                        collection_id: Some(collection_id_for_progress.clone()),
+                        collection_name: Some(folder_name.clone()),
+                        error: Some(reason),
+                    });
                 }
             }
         }
@@ -728,6 +856,7 @@ async fn upload_folder(
                             status: "cancelled".to_string(),
                             collection_id: Some(coll_id.clone()),
                             collection_name: Some(coll_name.clone()),
+                            error: None,
                         });
                         break;
                     }
@@ -743,6 +872,7 @@ async fn upload_folder(
                         status: "uploading".to_string(),
                         collection_id: Some(coll_id.clone()),
                         collection_name: Some(coll_name.clone()),
+                        error: None,
                     });
 
                     let upload_result = match item {
@@ -753,9 +883,9 @@ async fn upload_folder(
                                 &progress, Some(coll_id.clone()), Some(coll_name.clone()),
                             ).await
                         }
-                        BatchWorkItem::Multipart { upload_id, initial_urls, .. } => {
+                        BatchWorkItem::Multipart { upload_id, part_size, initial_urls, .. } => {
                             upload_multipart_to_r2(
-                                path, &upload_id, &r2_key, file_info.size, initial_urls,
+                                path, &upload_id, &r2_key, file_info.size, part_size, initial_urls,
                                 &file_info.file_id, &file_info.filename, &progress,
                                 Some(coll_id.clone()), Some(coll_name.clone()),
                             ).await
@@ -773,6 +903,7 @@ async fn upload_folder(
                                 status: "confirming".to_string(),
                                 collection_id: Some(coll_id.clone()),
                                 collection_name: Some(coll_name.clone()),
+                                error: None,
                             });
                             uploaded.push((idx, file_info.filename, file_info.content_type, r2_key, file_info.size));
                         }
@@ -787,6 +918,7 @@ async fn upload_folder(
                                 status: "error".to_string(),
                                 collection_id: Some(coll_id.clone()),
                                 collection_name: Some(coll_name.clone()),
+                                error: None,
                             });
                         }
                     }
@@ -821,6 +953,36 @@ async fn upload_folder(
             let confirm_results = confirm_batch(Some(collection_id.clone()), uploaded_files).await?;
 
             for (idx_str, result) in confirm_results {
+                // A file whose bytes reached R2 but whose record was refused
+                // (blocked extension, blocked hash, key already claimed) used
+                // to fall out of this loop with nothing said: no event, so its
+                // row sat on "confirming" forever and the collection was short.
+                // Same silent shortfall as a refused init, one step later.
+                if !result.success || result.file.is_none() {
+                    let name = idx_str
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|i| batch_uploaded.get(i))
+                        .map(|(n, _): &(String, u64)| n.clone())
+                        .unwrap_or_else(|| "This file".to_string());
+                    let reason = result
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "The server would not save this file.".to_string());
+                    eprintln!("[Batch] Refused on confirm: {} - {}", name, reason);
+                    let _ = on_progress.send(UploadProgress {
+                        file_id: Uuid::new_v4().to_string(),
+                        filename: name,
+                        bytes_uploaded: 0,
+                        total_bytes: 0,
+                        percentage: 0.0,
+                        status: "error".to_string(),
+                        collection_id: Some(collection_id_for_progress.clone()),
+                        collection_name: Some(folder_name.clone()),
+                        error: Some(reason),
+                    });
+                    continue;
+                }
                 if result.success {
                     if let Some(file) = result.file {
                         if let Ok(idx) = idx_str.parse::<usize>() {
@@ -889,6 +1051,7 @@ async fn upload_folder(
                 status: "complete".to_string(),
                 collection_id: Some(collection_id.clone()),
                 collection_name: Some(folder_name.clone()),
+                error: None,
             });
         }
     }
@@ -899,6 +1062,7 @@ async fn upload_folder(
         size: total_size,
         is_collection: true,
         file_count: Some(success_count),
+        attempted_count: Some(file_infos.len() as u32),
     };
 
     // Apply default expiry if configured (0 = permanent, skip)
@@ -969,7 +1133,7 @@ async fn fetch_remote_history(query: Option<String>) -> Result<Vec<UploadHistory
         (format!("{}/api/files", api_url), false)
     };
 
-    let client = reqwest::Client::builder()
+    let client = upload::api_client_builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| format!("http client: {}", e))?;
@@ -1230,7 +1394,9 @@ async fn get_auth_status(state: State<'_, AppState>) -> Result<serde_json::Value
 
     // Fetch user info from API
     let api_url = get_api_url();
-    let client = reqwest::Client::new();
+    let client = upload::api_client_builder()
+        .build()
+        .map_err(|e| format!("http client: {}", e))?;
     let response = client
         .get(format!("{}/api/user", api_url))
         .header("Authorization", format!("Bearer {}", token))
@@ -1276,7 +1442,7 @@ async fn get_limits(state: State<'_, AppState>) -> Result<serde_json::Value, Str
     };
     let visitor_token = get_visitor_token();
 
-    let client = reqwest::Client::builder()
+    let client = upload::api_client_builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| format!("http client: {}", e))?;
@@ -1304,7 +1470,9 @@ async fn get_limits(state: State<'_, AppState>) -> Result<serde_json::Value, Str
 /// auto-set it to 0 (permanent) so their uploads stay forever by default.
 async fn set_permanent_default_if_premium_first_login(app: &AppHandle, token: &str) {
     let api_url = get_api_url();
-    let client = reqwest::Client::new();
+    let Ok(client) = upload::api_client_builder().build() else {
+        return;
+    };
     let Ok(resp) = client
         .get(format!("{}/api/user", api_url))
         .header("Authorization", format!("Bearer {}", token))
@@ -1383,9 +1551,8 @@ async fn logout(state: State<'_, AppState>) -> Result<(), String> {
     };
 
     // Revoke token on API (fire and forget)
-    if let Some(token) = &auth_token {
+    if let (Some(token), Ok(client)) = (&auth_token, upload::api_client_builder().build()) {
         let api_url = get_api_url();
-        let client = reqwest::Client::new();
         let _ = client
             .post(format!("{}/api/auth/logout", api_url))
             .header("Authorization", format!("Bearer {}", token))
@@ -1400,26 +1567,31 @@ async fn logout(state: State<'_, AppState>) -> Result<(), String> {
     save_config(&config)
 }
 
-/// Send analytics event to API
-async fn send_analytics_event(event: &str, context: Option<serde_json::Value>) {
+/// POST a JSON body to a storage.to app-reporting endpoint with the standard
+/// identity headers (visitor token, auth bearer, X-Storageto-Client via the
+/// shared client builder). `app` and `version` are stamped here so callers
+/// can't drift. Errors come back as "status:<code>" for HTTP failures (so the
+/// frontend queue can drop 4xx and retry 5xx) or "network:<msg>" when no
+/// response arrived.
+///
+/// This lives in Rust because the webview cannot do it: WKWebView enforces
+/// CORS for the tauri:// origin and the API has no preflight handling, so
+/// webview fetch() to these endpoints has never delivered (see issue #18).
+pub async fn post_app_report(path: &str, mut body: serde_json::Value) -> Result<(), String> {
     let api_url = get_api_url();
     let visitor_token = get_visitor_token();
     let auth_token = get_auth_token();
-    let version = env!("CARGO_PKG_VERSION");
 
-    let client = reqwest::Client::new();
-    let mut body = serde_json::json!({
-        "app": "desktop",
-        "version": version,
-        "event": event,
-    });
+    body["app"] = serde_json::json!("desktop");
+    body["version"] = serde_json::json!(env!("CARGO_PKG_VERSION"));
 
-    if let Some(ctx) = context {
-        body["context"] = ctx;
-    }
+    let client = upload::api_client_builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("network:{}", e))?;
 
     let mut request = client
-        .post(format!("{}/api/app-analytics", api_url))
+        .post(format!("{}{}", api_url, path))
         .header("Accept", "application/json")
         .json(&body);
 
@@ -1431,8 +1603,40 @@ async fn send_analytics_event(event: &str, context: Option<serde_json::Value>) {
         request = request.header("Authorization", format!("Bearer {}", token));
     }
 
-    // Fire and forget - we don't care about the result for heartbeats
-    let _ = request.send().await;
+    let response = request.send().await.map_err(|e| format!("network:{}", e))?;
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("status:{}", response.status().as_u16()))
+    }
+}
+
+/// Send analytics event to API (fire and forget - heartbeats don't retry)
+async fn send_analytics_event(event: &str, context: Option<serde_json::Value>) {
+    let mut body = serde_json::json!({ "event": event });
+    if let Some(ctx) = context {
+        body["context"] = ctx;
+    }
+    let _ = post_app_report("/api/app-analytics", body).await;
+}
+
+/// Frontend analytics transport (analyticsReporter.ts). The webview queues and
+/// retries; this just delivers one event and reports the outcome.
+#[tauri::command]
+async fn send_app_event(event: String, context: Option<serde_json::Value>) -> Result<(), String> {
+    let mut body = serde_json::json!({ "event": event });
+    if let Some(ctx) = context {
+        body["context"] = ctx;
+    }
+    post_app_report("/api/app-analytics", body).await
+}
+
+/// Frontend error-report transport (errorReporter.ts). Same contract as
+/// send_app_event; `report` carries type/message/stack/os/context and Rust
+/// stamps app + version.
+#[tauri::command]
+async fn send_app_error(report: serde_json::Value) -> Result<(), String> {
+    post_app_report("/api/app-errors", report).await
 }
 
 /// Start the background heartbeat task using Tauri's async runtime
@@ -1846,7 +2050,93 @@ pub fn run() {
             get_auth_status,
             get_limits,
             logout,
+            send_app_event,
+            send_app_error,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod app_report_tests {
+    use super::*;
+    use std::io::{Read as IoRead, Write as IoWrite};
+    use std::net::TcpListener;
+
+    /// Full check of the reporting transport against a live stub server:
+    /// path, app/version stamping, identity header, and the status:/network:
+    /// error contract the frontend queues rely on. Mutates $HOME (config
+    /// isolation), so ignored in a normal run - execute manually:
+    ///   cargo test app_report -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "mutates $HOME for config isolation; run manually"]
+    async fn post_app_report_contract() {
+        let fake_home = std::env::temp_dir().join(format!("storageto-report-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&fake_home).unwrap();
+        std::env::set_var("HOME", &fake_home);
+
+        fn serve_one(listener: TcpListener, status_line: &'static str) -> std::thread::JoinHandle<String> {
+            std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut buf = [0u8; 65536];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let _ = stream.write_all(
+                    format!("HTTP/1.1 {}\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{{}}", status_line).as_bytes(),
+                );
+                req
+            })
+        }
+
+        // Case 1: success - request shape is right and Ok comes back.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = serve_one(listener, "200 OK");
+
+        let mut config = storage::AppConfig::new();
+        config.api_url = format!("http://{}", addr);
+        // Must be UUID-shaped or get_visitor_token() regenerates it.
+        config.visitor_token = Some("550e8400-e29b-41d4-a716-446655440000".to_string());
+        storage::save_config(&config).unwrap();
+
+        post_app_report("/api/app-analytics", serde_json::json!({ "event": "app_launch" }))
+            .await
+            .expect("200 must be Ok");
+        let req = server.join().unwrap();
+        let req_lower = req.to_lowercase();
+        assert!(req.starts_with("POST /api/app-analytics"), "path: {}", req.lines().next().unwrap_or(""));
+        assert!(req_lower.contains("x-storageto-client: desktop"), "missing client header");
+        assert!(req_lower.contains("x-visitor-token: 550e8400-e29b-41d4-a716-446655440000"), "missing visitor token");
+        assert!(req.contains(r#""app":"desktop""#), "app not stamped: {}", req);
+        assert!(req.contains(&format!(r#""version":"{}""#, env!("CARGO_PKG_VERSION"))), "version not stamped");
+        assert!(req.contains(r#""event":"app_launch""#), "event missing");
+
+        // Case 2: HTTP error surfaces as status:<code> (frontend drops 4xx).
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = serve_one(listener, "422 Unprocessable Entity");
+        let mut config = storage::AppConfig::new();
+        config.api_url = format!("http://{}", addr);
+        storage::save_config(&config).unwrap();
+
+        let err = post_app_report("/api/app-errors", serde_json::json!({ "type": "js_error", "message": "boom" }))
+            .await
+            .expect_err("422 must be Err");
+        assert_eq!(err, "status:422");
+        let req = server.join().unwrap();
+        assert!(req.starts_with("POST /api/app-errors"), "path: {}", req.lines().next().unwrap_or(""));
+
+        // Case 3: unreachable server surfaces as network:<msg> (frontend retries).
+        let dead = TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        drop(dead);
+        let mut config = storage::AppConfig::new();
+        config.api_url = format!("http://{}", dead_addr);
+        storage::save_config(&config).unwrap();
+
+        let err = post_app_report("/api/app-analytics", serde_json::json!({ "event": "heartbeat" }))
+            .await
+            .expect_err("dead server must be Err");
+        assert!(err.starts_with("network:"), "err: {}", err);
+    }
 }

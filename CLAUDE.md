@@ -43,6 +43,15 @@ Or better, use the release script:
 - In `#[tauri::command]` async functions, `tokio::spawn()` is fine
 - The difference: setup runs during app initialization before runtime is fully ready
 
+### Webview fetch() To Remote Hosts Does Not Work
+
+WKWebView enforces CORS for the `tauri://` origin and the storage.to API has no
+preflight handling, so a webview `fetch()` to any remote API **silently never
+delivers** (this is how analytics/error reporting was dead until v0.2.42, #18).
+All remote HTTP belongs in Rust (`post_app_report` / reqwest via
+`upload::api_client_builder`), exposed to the frontend as Tauri commands. The
+CSP pins `connect-src 'self'` to make this structural - do not widen it.
+
 ### JavaScript Timers Don't Work When Hidden
 
 This is a **menu bar app** - the window is hidden most of the time.

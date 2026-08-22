@@ -9,8 +9,14 @@ use std::path::Path;
 use tauri::ipc::Channel;
 use uuid::Uuid;
 
-const CHUNK_SIZE: u64 = 32 * 1024 * 1024; // 32MB chunks (matches API PART_SIZE)
+// Fallback part size, used ONLY when the API did not send a part_size (an
+// older deployment). Not a mirror of the server's value: see upload_multipart_v2
+// for why the server's wins when it is offered.
+const CHUNK_SIZE: u64 = 32 * 1024 * 1024;
 const BATCH_SIZE: usize = 250; // Max files per batch API call
+/// How many part URLs to fetch per /api/upload/parts call, matching the number
+/// init mints up front (INIT_URL_BATCH_SIZE server-side).
+const PART_URL_WINDOW: u32 = 250;
 
 // Debug logging to file
 fn debug_log(msg: &str) {
@@ -35,6 +41,10 @@ pub struct UploadProgress {
     pub status: String,
     pub collection_id: Option<String>,
     pub collection_name: Option<String>,
+    /// Why this file failed, when the server told us. Serialized as `error`;
+    /// the UI shows it on the row instead of a bare "failed".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,7 +53,12 @@ pub struct UploadResult {
     pub filename: String,
     pub size: u64,
     pub is_collection: bool,
+    /// Files that actually landed.
     pub file_count: Option<u32>,
+    /// Files the user asked for. Only the Rust side knows this for a folder -
+    /// the frontend hands over one path and gets a count back - so a shortfall
+    /// is invisible to the UI and to analytics unless it travels here.
+    pub attempted_count: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,7 +73,6 @@ struct InitUploadResponse {
     headers: Option<std::collections::HashMap<String, Vec<String>>>,
     // Multipart fields
     upload_id: Option<String>,
-    #[allow(dead_code)]
     part_size: Option<i64>,
     #[allow(dead_code)]
     total_parts: Option<i32>,
@@ -149,6 +163,9 @@ pub struct InitBatchResult {
     pub upload_type: Option<String>,
     // Multipart fields (for large files)
     pub upload_id: Option<String>,
+    /// The chunk size the server minted this session with. Slicing on a local
+    /// copy instead of this is one edit away from silently misaligned parts.
+    pub part_size: Option<i64>,
     pub initial_urls: Option<std::collections::HashMap<String, String>>,
     // Error handling
     #[allow(dead_code)]
@@ -181,7 +198,6 @@ struct ConfirmBatchResponse {
 pub struct ConfirmBatchResult {
     pub success: bool,
     pub file: Option<BatchConfirmedFile>,
-    #[allow(dead_code)]
     pub error: Option<String>,
 }
 
@@ -208,9 +224,19 @@ use std::sync::OnceLock;
 
 static HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
 
+/// Client builder for storage.to API calls. Declares the app via a default
+/// X-Storageto-Client header so uploads/downloads are attributed to `desktop`
+/// rather than falling through to the generic `api` bucket. A default header
+/// on the builder means a new endpoint can't silently regress attribution.
+pub fn api_client_builder() -> reqwest::ClientBuilder {
+    let mut headers = HeaderMap::new();
+    headers.insert("X-Storageto-Client", HeaderValue::from_static("desktop"));
+    Client::builder().default_headers(headers)
+}
+
 fn get_client() -> &'static Client {
     HTTP_CLIENT.get_or_init(|| {
-        Client::builder()
+        api_client_builder()
             // No overall timeout - uploads can take a long time
             // Only set connect timeout
             .connect_timeout(std::time::Duration::from_secs(30))
@@ -242,6 +268,26 @@ fn get_content_type(path: &Path) -> String {
     mime_guess::from_path(path)
         .first_or_octet_stream()
         .to_string()
+}
+
+/// Whether a failed API response is worth retrying. 5xx is transient, and the
+/// per-minute throttle 429 ({"message":"Too Many Requests"} + Retry-After)
+/// clears on its own. Every other 4xx is terminal - in particular the
+/// anonymous daily quota 429s ({error, limit, used} for the file-count cap,
+/// {error, limit_gb, used_gb} for the byte quota): the count cap records every
+/// attempt BEFORE checking, so auto-retrying a tripped cap keeps it tripped.
+fn should_retry_api_error(status: reqwest::StatusCode, body: &str) -> bool {
+    if status.is_server_error() {
+        return true;
+    }
+    if status.as_u16() == 429 {
+        // Quota 429s carry an app-level `error` field; the transient throttle
+        // body only has `message`. An unparseable body gets retried.
+        return serde_json::from_str::<serde_json::Value>(body)
+            .map(|v| v.get("error").is_none())
+            .unwrap_or(true);
+    }
+    false
 }
 
 /// Initialize multiple uploads in a single API call (max 250 files per batch)
@@ -332,9 +378,13 @@ pub async fn confirm_batch(
         };
 
         if !response.status().is_success() {
+            let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
             last_error = format!("Confirm batch failed: {}", error_text);
             debug_log(&format!("[Batch] {}", last_error));
+            if !should_retry_api_error(status, &error_text) {
+                return Err(last_error);
+            }
             continue;
         }
 
@@ -368,11 +418,13 @@ pub async fn upload_to_r2(
 }
 
 /// Upload a large file to R2 using multipart upload (no init/confirm API calls, just R2 parts + complete)
+#[allow(clippy::too_many_arguments)]
 pub async fn upload_multipart_to_r2(
     path: &Path,
     upload_id: &str,
     r2_key: &str,
     size: u64,
+    server_part_size: Option<i64>,
     initial_urls: std::collections::HashMap<String, String>,
     file_id: &str,
     filename: &str,
@@ -387,6 +439,7 @@ pub async fn upload_multipart_to_r2(
         upload_id,
         r2_key,
         size,
+        server_part_size,
         initial_urls,
         file_id,
         filename,
@@ -430,6 +483,7 @@ pub async fn upload_file(
         status: "initializing".to_string(),
         collection_id: None,
         collection_name: None,
+        error: None,
     });
 
     let client = get_client();
@@ -498,6 +552,7 @@ pub async fn upload_file(
         status: "uploading".to_string(),
         collection_id: None,
         collection_name: None,
+        error: None,
     });
 
     if upload_type == "multipart" {
@@ -512,6 +567,7 @@ pub async fn upload_file(
             &upload_id,
             &r2_key,
             size,
+            init_data.part_size,
             initial_urls,
             &file_id,
             &filename,
@@ -536,6 +592,7 @@ pub async fn upload_file(
         status: "confirming".to_string(),
         collection_id: None,
         collection_name: None,
+        error: None,
     });
 
     let confirm_request = ConfirmUploadRequest {
@@ -606,6 +663,7 @@ pub async fn upload_file(
         status: "complete".to_string(),
         collection_id: None,
         collection_name: None,
+        error: None,
     });
 
     Ok(UploadResult {
@@ -614,6 +672,7 @@ pub async fn upload_file(
         size,
         is_collection: false,
         file_count: None,
+        attempted_count: None,
     })
 }
 
@@ -666,6 +725,7 @@ async fn upload_single(
                         status: "uploading".to_string(),
                         collection_id: coll_id.clone(),
                         collection_name: coll_name.clone(),
+                        error: None,
                     });
 
                     yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&buffer[..n]));
@@ -711,6 +771,7 @@ async fn upload_single(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn upload_multipart_v2(
     client: &Client,
     api_url: &str,
@@ -718,6 +779,16 @@ async fn upload_multipart_v2(
     upload_id: &str,
     _r2_key: &str,
     total_size: u64,
+    // The part size the server minted this session with, from the init response.
+    //
+    // R2 stores whatever bytes each presigned part PUT carries and assembles by
+    // part number, so a client/server mismatch does not misplace bytes. What it
+    // does break is the part COUNT: slice a 40GB file at 32MB when the server
+    // said 64MB and you need 1,250 parts instead of 625, which walks into S3's
+    // 10,000-part limit sooner and, more immediately, past the 250 URLs init
+    // mints. Following the server keeps those in step. None means an API older
+    // than this client, and only then do we fall back.
+    server_part_size: Option<i64>,
     initial_urls: std::collections::HashMap<String, String>,
     file_id: &str,
     filename: &str,
@@ -730,6 +801,20 @@ async fn upload_multipart_v2(
 
     const MAX_CONCURRENT: usize = 4;
     const MAX_RETRIES: u32 = 3;
+
+    // The server's value wins, inside sane bounds. Unclamped it is a remote
+    // input controlling an allocation: MAX_CONCURRENT parts are pre-read into
+    // memory and each retry clones one, so peak RAM is about 8x this number.
+    // The floor is S3's own rule - a non-final part under 5MiB is rejected
+    // with EntityTooSmall - and the ceiling keeps a mistake at the API from
+    // turning into an OOM on someone's laptop.
+    const MIN_PART: u64 = 5 * 1024 * 1024;
+    const MAX_PART: u64 = 128 * 1024 * 1024;
+    let chunk_size: u64 = match server_part_size {
+        Some(n) if n > 0 => (n as u64).clamp(MIN_PART, MAX_PART),
+        // No part_size in the response: an API older than this client.
+        _ => CHUNK_SIZE,
+    };
 
     let mut file = tokio::fs::File::open(path)
         .await
@@ -746,8 +831,8 @@ async fn upload_multipart_v2(
 
         // Pre-read up to MAX_CONCURRENT parts from disk
         for _ in 0..MAX_CONCURRENT {
-            let part_start = (part_number as u64 - 1) * CHUNK_SIZE;
-            let part_size = std::cmp::min(CHUNK_SIZE, total_size.saturating_sub(part_start)) as usize;
+            let part_start = (part_number as u64 - 1) * chunk_size;
+            let part_size = std::cmp::min(chunk_size, total_size.saturating_sub(part_start)) as usize;
 
             if part_size == 0 {
                 break;
@@ -764,7 +849,10 @@ async fn upload_multipart_v2(
             let part_url = match part_urls.get(&part_key) {
                 Some(url) => url.clone(),
                 None => {
-                    let more_urls = get_more_parts_v2(client, api_url, upload_id, part_number).await?;
+                    // Ask for a window of URLs, not just this one: the round
+                    // trip is the expensive part, and 250 is what init mints.
+                    let more_urls =
+                        get_more_parts_v2(client, api_url, upload_id, part_number, PART_URL_WINDOW).await?;
                     part_urls.extend(more_urls);
                     part_urls.get(&part_key)
                         .ok_or_else(|| format!("Missing URL for part {}", part_number))?
@@ -843,9 +931,13 @@ async fn upload_multipart_v2(
         };
 
         if !resp.status().is_success() {
+            let status = resp.status();
             let error_text = resp.text().await.unwrap_or_default();
             last_error = format!("Complete multipart failed: {}", error_text);
             debug_log(&format!("[Multipart] {}", last_error));
+            if !should_retry_api_error(status, &error_text) {
+                return Err(last_error);
+            }
             continue;
         }
 
@@ -904,6 +996,7 @@ async fn upload_part_with_retry(
                     status: "uploading".to_string(),
                     collection_id: p_coll_id.clone(),
                     collection_name: p_coll_name.clone(),
+                    error: None,
                 });
 
                 yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(chunk));
@@ -961,28 +1054,49 @@ async fn upload_part_with_retry(
     Err(format!("Part {} upload failed after {} attempts", part_number, max_retries))
 }
 
+/// Fetch presigned URLs for the next window of parts.
+///
+/// The request and response shapes here were BOTH wrong, and had been since
+/// this function was written: it sent `{start_part, count}` and read
+/// `part_urls`, while POST /api/upload/parts requires `part_numbers` (an
+/// explicit array) and answers `{success, urls}`. The server replied 422 "The
+/// part numbers field is required." and the whole file died.
+///
+/// Init only ever hands out the first INIT_URL_BATCH_SIZE (250) part URLs, so
+/// this is the ONLY way to reach part 251 onward. At a 32MB part size that put
+/// a hard ceiling at ~7.8GB on every desktop upload, against a plan limit of
+/// 100GB - and the ceiling was invisible, because it looked like one file
+/// failing rather than a size limit. Prod bears it out: the largest file ever
+/// uploaded from the desktop app is 4.95GB, while web has done 37.8GB.
+///
+/// The Go CLI has always sent the right shape (cli/internal/api/client.go),
+/// which is why this survived: nothing else spoke this dialect.
 async fn get_more_parts_v2(
     client: &Client,
     api_url: &str,
     upload_id: &str,
     start_part: u32,
+    count: u32,
 ) -> Result<std::collections::HashMap<String, String>, String> {
     #[derive(Serialize)]
     struct GetPartsRequest {
         upload_id: String,
-        start_part: u32,
-        count: u32,
+        part_numbers: Vec<u32>,
     }
 
     #[derive(Deserialize)]
     struct GetPartsResponse {
-        part_urls: std::collections::HashMap<String, String>,
+        #[serde(default)]
+        success: Option<bool>,
+        #[serde(default)]
+        urls: std::collections::HashMap<String, String>,
+        #[serde(default)]
+        error: Option<String>,
     }
 
     let request = GetPartsRequest {
         upload_id: upload_id.to_string(),
-        start_part,
-        count: 250,
+        part_numbers: (start_part..start_part + count).collect(),
     };
 
     let response = client
@@ -993,16 +1107,28 @@ async fn get_more_parts_v2(
         .await
         .map_err(|e| format!("Failed to get part URLs: {}", e))?;
 
-    if !response.status().is_success() {
-        return Err("Failed to get more part URLs".to_string());
+    // Carry the server's own words. "Failed to get more part URLs" is what made
+    // the 422 above unreadable for as long as it shipped.
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read parts response: {}", e))?;
+
+    if !status.is_success() {
+        return Err(format!("Could not get upload URLs (HTTP {}): {}", status.as_u16(), body));
     }
 
-    let data: GetPartsResponse = response
-        .json()
-        .await
+    let data: GetPartsResponse = serde_json::from_str(&body)
         .map_err(|e| format!("Failed to parse parts response: {}", e))?;
 
-    Ok(data.part_urls)
+    // A 200 carrying {"success":false} is how this route reports an upload that
+    // is no longer active or has expired - not an HTTP error.
+    if data.success == Some(false) {
+        return Err(data.error.unwrap_or_else(|| "Upload session is no longer active.".to_string()));
+    }
+
+    Ok(data.urls)
 }
 
 pub async fn create_collection(expected_file_count: Option<usize>) -> Result<CollectionInfo, String> {
@@ -1067,9 +1193,13 @@ pub async fn mark_collection_ready(collection_id: String) -> Result<CollectionIn
         };
 
         if !response.status().is_success() {
+            let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
             last_error = format!("Mark collection ready failed: {}", error_text);
             debug_log(&format!("[Collection] {}", last_error));
+            if !should_retry_api_error(status, &error_text) {
+                return Err(last_error);
+            }
             continue;
         }
 
@@ -1134,6 +1264,153 @@ pub async fn delete_file(file_id: String, is_collection: bool) -> Result<(), Str
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use reqwest::StatusCode;
+
+    // Real bodies from the API (bandwidth-window.ts overCountError /
+    // bandwidth/index.ts overLimitError / rate-limit.ts tooManyRequests).
+    const COUNT_CAP_429: &str = r#"{"success":false,"error":"Daily upload limit reached (50 files in 24 hours). Create a free account for higher limits.","limit":50,"used":51}"#;
+    const BYTE_QUOTA_429: &str = r#"{"success":false,"error":"Daily bandwidth limit exceeded.","limit_gb":100,"used_gb":101}"#;
+    const THROTTLE_429: &str = r#"{"message":"Too Many Requests"}"#;
+
+    #[test]
+    fn server_errors_retry() {
+        assert!(should_retry_api_error(StatusCode::INTERNAL_SERVER_ERROR, ""));
+        assert!(should_retry_api_error(StatusCode::BAD_GATEWAY, "<html>502</html>"));
+    }
+
+    #[test]
+    fn throttle_429_retries() {
+        assert!(should_retry_api_error(StatusCode::TOO_MANY_REQUESTS, THROTTLE_429));
+    }
+
+    #[test]
+    fn quota_429s_are_terminal() {
+        assert!(!should_retry_api_error(StatusCode::TOO_MANY_REQUESTS, COUNT_CAP_429));
+        assert!(!should_retry_api_error(StatusCode::TOO_MANY_REQUESTS, BYTE_QUOTA_429));
+    }
+
+    #[test]
+    fn unparseable_429_retries() {
+        assert!(should_retry_api_error(StatusCode::TOO_MANY_REQUESTS, "gateway timeout"));
+    }
+
+    #[test]
+    fn other_client_errors_are_terminal() {
+        assert!(!should_retry_api_error(StatusCode::BAD_REQUEST, r#"{"success":false,"error":"bad"}"#));
+        assert!(!should_retry_api_error(StatusCode::FORBIDDEN, ""));
+    }
+
+    /// Behavior check against a live stub server: a quota 429 must abort
+    /// confirm_batch after exactly ONE request; a throttle 429 must still be
+    /// retried. Mutates $HOME (config isolation), so it is ignored in a normal
+    /// run - execute manually:
+    ///   cargo test retry_behavior -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "mutates $HOME for config isolation; run manually"]
+    async fn retry_behavior_against_stub_server() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        fn serve(listener: TcpListener, responses: Vec<(u16, &'static str, String)>, hits: Arc<AtomicU32>) {
+            std::thread::spawn(move || {
+                for (status, reason, body) in responses {
+                    let (mut stream, _) = match listener.accept() {
+                        Ok(s) => s,
+                        Err(_) => return,
+                    };
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    // Drain the request (headers + JSON body) before answering.
+                    let mut buf = [0u8; 65536];
+                    let _ = stream.read(&mut buf);
+                    let _ = stream.write_all(
+                        format!(
+                            "HTTP/1.1 {} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            status, reason, body.len(), body
+                        )
+                        .as_bytes(),
+                    );
+                }
+            });
+        }
+
+        let fake_home = std::env::temp_dir().join(format!("storageto-retry-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&fake_home).unwrap();
+        std::env::set_var("HOME", &fake_home);
+
+        let files = vec![BatchConfirmFile {
+            filename: "a.txt".to_string(),
+            size: 1,
+            content_type: "text/plain".to_string(),
+            r2_key: "k".to_string(),
+        }];
+
+        // Case 0: the count cap fires at /api/upload/init - upload_file must
+        // fail on the first 429 with the cap's message, no second request.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicU32::new(0));
+        serve(listener, vec![(429, "Too Many Requests", COUNT_CAP_429.to_string())], hits.clone());
+
+        let mut config = crate::storage::AppConfig::new();
+        config.api_url = format!("http://{}", addr);
+        crate::storage::save_config(&config).unwrap();
+
+        let capped_file = fake_home.join("capped.txt");
+        std::fs::write(&capped_file, b"over the daily cap").unwrap();
+        let err = upload_file(
+            capped_file.to_string_lossy().to_string(),
+            None,
+            Channel::new(|_| Ok(())),
+            None,
+        )
+        .await
+        .expect_err("init 429 must fail the upload");
+        assert!(err.contains("Daily upload limit reached"), "err: {}", err);
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "a capped init must not be retried");
+
+        // Case 1: quota 429 at confirm-batch -> terminal after exactly one request.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicU32::new(0));
+        serve(listener, vec![(429, "Too Many Requests", BYTE_QUOTA_429.to_string())], hits.clone());
+
+        let mut config = crate::storage::AppConfig::new();
+        config.api_url = format!("http://{}", addr);
+        crate::storage::save_config(&config).unwrap();
+
+        let err = confirm_batch(None, files.clone()).await.expect_err("quota 429 must fail");
+        assert!(err.contains("Daily bandwidth limit"), "err: {}", err);
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "quota 429 must not be retried");
+
+        // Case 2: throttle 429 then success -> retried and succeeds.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicU32::new(0));
+        let ok_body = r#"{"success":true,"results":{"a.txt":{"success":true,"file":{"id":"x","url":"http://x/f"}}}}"#;
+        serve(
+            listener,
+            vec![
+                (429, "Too Many Requests", THROTTLE_429.to_string()),
+                (200, "OK", ok_body.to_string()),
+            ],
+            hits.clone(),
+        );
+
+        let mut config = crate::storage::AppConfig::new();
+        config.api_url = format!("http://{}", addr);
+        crate::storage::save_config(&config).unwrap();
+
+        let results = confirm_batch(None, files).await.expect("throttle 429 must be retried to success");
+        assert_eq!(results.len(), 1);
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "throttle 429 should retry once then succeed");
+    }
 }
 
 pub async fn set_password(file_id: String, is_collection: bool, password: String) -> Result<(), String> {
@@ -1321,6 +1598,90 @@ pub async fn remove_password(file_id: String, is_collection: bool) -> Result<(),
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write as IoWrite};
+    use std::net::TcpListener;
+
+    /// Every request made through api_client_builder() must carry
+    /// X-Storageto-Client: desktop, so uploads/downloads are attributed to the
+    /// desktop app instead of the generic `api` bucket.
+    #[tokio::test]
+    async fn api_client_declares_desktop_channel() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut headers = Vec::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("read");
+                if line.trim().is_empty() {
+                    break;
+                }
+                headers.push(line.trim().to_lowercase());
+            }
+            let mut stream = stream;
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n");
+            headers
+        });
+
+        let client = api_client_builder().build().expect("client");
+        let _ = client
+            .get(format!("http://{}/api/limits", addr))
+            .send()
+            .await
+            .expect("request");
+
+        let headers = server.join().expect("server thread");
+        assert!(
+            headers.contains(&"x-storageto-client: desktop".to_string()),
+            "missing X-Storageto-Client header, got: {:?}",
+            headers
+        );
+    }
+
+    /// Full round trip against a running local API (issue #9 acceptance check):
+    /// uploads through the app's real single-file path, then the file row must
+    /// have upload_channel = desktop. Ignored in CI; run manually with a local
+    /// API up:
+    ///   STORAGETO_TEST_API=http://localhost:8796 cargo test --release -- --ignored
+    #[tokio::test]
+    #[ignore = "needs a running local API (set STORAGETO_TEST_API)"]
+    async fn e2e_upload_declares_desktop_channel() {
+        let api = std::env::var("STORAGETO_TEST_API")
+            .unwrap_or_else(|_| "http://localhost:8796".to_string());
+
+        // Isolate config (api_url, visitor token, history) from the real app.
+        let fake_home = std::env::temp_dir().join(format!("storageto-e2e-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&fake_home).unwrap();
+        std::env::set_var("HOME", &fake_home);
+
+        let mut config = crate::storage::AppConfig::new();
+        config.api_url = api.clone();
+        crate::storage::save_config(&config).expect("save config");
+
+        let file_path = fake_home.join("issue-9-e2e.txt");
+        std::fs::write(&file_path, b"desktop channel attribution e2e (issue #9)").unwrap();
+
+        let progress = Channel::new(|_| Ok(()));
+        let result = upload_file(
+            file_path.to_string_lossy().to_string(),
+            None,
+            progress,
+            None,
+        )
+        .await
+        .expect("upload should succeed");
+
+        println!("uploaded: {}", result.url);
+        assert!(!result.url.is_empty());
+    }
 }
 
 pub async fn remove_burn_after_reading(file_id: String, is_collection: bool) -> Result<(), String> {
