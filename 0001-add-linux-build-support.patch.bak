@@ -1,0 +1,78 @@
+From 7d352634f7870611ebf116fca0eaf8c4f1c1f8ff Mon Sep 17 00:00:00 2001
+From: Your Name <you@example.com>
+Date: Thu, 16 Jul 2026 22:17:01 +0000
+Subject: [PATCH] Add Linux build support
+
+- Add ubuntu-22.04 to the release build matrix, targeting
+  x86_64-unknown-linux-gnu. ubuntu-22.04 is used (rather than
+  ubuntu-latest) so the produced .deb/.rpm/AppImage link against an
+  older glibc baseline for broader distro compatibility.
+- Install the Linux system dependencies required by Tauri
+  (libwebkit2gtk-4.1-dev, libgtk-3-dev, libayatana-appindicator3-dev,
+  librsvg2-dev, patchelf, build-essential) as a new CI step, gated to
+  the Linux job only.
+- Add deb, appimage, and rpm to the bundle targets in
+  tauri.conf.json so the Linux job actually produces installable
+  packages.
+
+Verified locally: frontend build, Linux system dependency
+installation, and bundle-target config all confirmed working on
+Ubuntu 24.04. The Rust source already contained target_os-gated
+fallback branches for tray icon, deep-link, and shortcuts on
+non-macOS/Windows platforms, so no application code changes were
+needed.
+---
+ .github/workflows/build.yml | 16 ++++++++++++++++
+ src-tauri/tauri.conf.json   |  2 +-
+ 2 files changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+index 0f61758..45ce897 100644
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@ -24,6 +24,9 @@ jobs:
+           - platform: windows-latest
+             args: ''
+             target: x86_64-pc-windows-msvc
++          - platform: ubuntu-22.04
++            args: ''
++            target: x86_64-unknown-linux-gnu
+ 
+     runs-on: ${{ matrix.platform }}
+ 
+@@ -42,6 +45,19 @@ jobs:
+         with:
+           targets: ${{ matrix.target }}
+ 
++      # Linux system dependencies (webkit2gtk, GTK, tray icon support)
++      - name: Install Linux system dependencies
++        if: matrix.platform == 'ubuntu-22.04'
++        run: |
++          sudo apt-get update
++          sudo apt-get install -y \
++            libwebkit2gtk-4.1-dev \
++            libgtk-3-dev \
++            libayatana-appindicator3-dev \
++            librsvg2-dev \
++            patchelf \
++            build-essential
++
+       # Windows code signing prerequisites
+       - name: Install trusted-signing-cli
+         if: matrix.platform == 'windows-latest'
+diff --git a/src-tauri/tauri.conf.json b/src-tauri/tauri.conf.json
+index 171c58a..dc23682 100644
+--- a/src-tauri/tauri.conf.json
++++ b/src-tauri/tauri.conf.json
+@@ -49,7 +49,7 @@
+   },
+   "bundle": {
+     "active": true,
+-    "targets": ["nsis", "app", "dmg"],
++    "targets": ["nsis", "app", "dmg", "deb", "appimage", "rpm"],
+     "createUpdaterArtifacts": "v1Compatible",
+     "icon": [
+       "icons/32x32.png",
+-- 
+2.43.0
+
