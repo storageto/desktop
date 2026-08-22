@@ -532,9 +532,25 @@ function CollectionUploadItem({ group }: { group: CollectionUploadGroup }) {
                 )}
               </div>
 
-              <span className={`text-xs truncate flex-1 ${file.status === "error" ? "text-red-400" : file.status === "queued" ? "text-[#57534e]" : "text-[#a8a29e]"}`}>
+              <span
+                className={`text-xs truncate flex-1 ${file.status === "error" ? "text-red-400" : file.status === "queued" ? "text-[#57534e]" : "text-[#a8a29e]"}`}
+                title={file.status === "error" && file.error ? `${file.filename} - ${file.error}` : file.filename}
+              >
                 {file.filename}
               </span>
+
+              {/* The reason, when the server gave one. `error` has been on
+                  UploadItem all along and was never rendered, so a refused
+                  file could only ever say "failed" - which is how 43 files
+                  refused by the concurrency wall read as an app glitch. */}
+              {file.status === "error" && file.error && (
+                <span
+                  className="text-[10px] text-red-400/70 truncate max-w-[45%] flex-shrink-0"
+                  title={file.error}
+                >
+                  {file.error}
+                </span>
+              )}
 
               {file.status === "uploading" && (
                 <span className="text-[10px] text-amber-500 tabular-nums flex-shrink-0">
