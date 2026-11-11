@@ -19,7 +19,7 @@ const BATCH_SIZE: usize = 250; // Max files per batch API call
 const PART_URL_WINDOW: u32 = 250;
 
 // Debug logging to file
-fn debug_log(msg: &str) {
+pub(crate) fn debug_log(msg: &str) {
     let log_path = "/tmp/storageto_upload.log";
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
@@ -132,6 +132,11 @@ struct ConfirmUploadRequest {
     content_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     collection_id: Option<String>,
+    /// The user's default expiry, sent WITH the confirm so the file is created
+    /// with it. Applying it only in a follow-up call meant a failure between
+    /// the two left the file on the server's 3-day default (desktop #26).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expiry_days: Option<u32>,
 }
 
 // Batch upload structs
@@ -184,6 +189,10 @@ pub struct BatchConfirmFile {
 #[derive(Debug, Serialize)]
 struct ConfirmBatchRequest {
     collection_id: Option<String>,
+    /// One expiry for the whole drop, applied to every member file at confirm
+    /// (same reason as ConfirmUploadRequest::expiry_days).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expiry_days: Option<u32>,
     files: Vec<BatchConfirmFile>,
 }
 
@@ -344,6 +353,7 @@ pub async fn init_batch(files: Vec<BatchFileRequest>) -> Result<std::collections
 pub async fn confirm_batch(
     collection_id: Option<String>,
     files: Vec<BatchConfirmFile>,
+    expiry_days: Option<u32>,
 ) -> Result<std::collections::HashMap<String, ConfirmBatchResult>, String> {
     let client = get_client();
     let api_url = get_api_url();
@@ -352,6 +362,7 @@ pub async fn confirm_batch(
 
     let request = ConfirmBatchRequest {
         collection_id,
+        expiry_days,
         files,
     };
 
@@ -460,6 +471,7 @@ pub async fn upload_file(
     collection_id: Option<String>,
     on_progress: Channel<UploadProgress>,
     existing_file_id: Option<String>,
+    expiry_days: Option<u32>,
 ) -> Result<UploadResult, String> {
     let path = Path::new(&path);
     let filename = path
@@ -601,6 +613,7 @@ pub async fn upload_file(
         size,
         content_type,
         collection_id: collection_id.clone(),
+        expiry_days,
     };
 
     let confirm_response = client
@@ -1369,6 +1382,7 @@ mod retry_tests {
             None,
             Channel::new(|_| Ok(())),
             None,
+            None,
         )
         .await
         .expect_err("init 429 must fail the upload");
@@ -1385,7 +1399,7 @@ mod retry_tests {
         config.api_url = format!("http://{}", addr);
         crate::storage::save_config(&config).unwrap();
 
-        let err = confirm_batch(None, files.clone()).await.expect_err("quota 429 must fail");
+        let err = confirm_batch(None, files.clone(), None).await.expect_err("quota 429 must fail");
         assert!(err.contains("Daily bandwidth limit"), "err: {}", err);
         assert_eq!(hits.load(Ordering::SeqCst), 1, "quota 429 must not be retried");
 
@@ -1407,7 +1421,7 @@ mod retry_tests {
         config.api_url = format!("http://{}", addr);
         crate::storage::save_config(&config).unwrap();
 
-        let results = confirm_batch(None, files).await.expect("throttle 429 must be retried to success");
+        let results = confirm_batch(None, files, None).await.expect("throttle 429 must be retried to success");
         assert_eq!(results.len(), 1);
         assert_eq!(hits.load(Ordering::SeqCst), 2, "throttle 429 should retry once then succeed");
     }
@@ -1611,6 +1625,30 @@ mod tests {
     use std::io::{BufRead, BufReader, Write as IoWrite};
     use std::net::TcpListener;
 
+    /// The default expiry rides on confirm (desktop #26). Absent when unset,
+    /// so a no-default user still gets the server's own default.
+    #[test]
+    fn confirm_requests_carry_expiry_days() {
+        let single = |days| serde_json::to_value(ConfirmUploadRequest {
+            r2_key: "k".into(),
+            filename: "f".into(),
+            size: 1,
+            content_type: "text/plain".into(),
+            collection_id: None,
+            expiry_days: days,
+        }).unwrap();
+        assert_eq!(single(Some(7))["expiry_days"], 7);
+        assert!(single(None).get("expiry_days").is_none());
+
+        let batch = |days| serde_json::to_value(ConfirmBatchRequest {
+            collection_id: Some("c".into()),
+            expiry_days: days,
+            files: vec![],
+        }).unwrap();
+        assert_eq!(batch(Some(5))["expiry_days"], 5);
+        assert!(batch(None).get("expiry_days").is_none());
+    }
+
     /// Every request made through api_client_builder() must carry
     /// X-Storageto-Client: desktop, so uploads/downloads are attributed to the
     /// desktop app instead of the generic `api` bucket.
@@ -1679,6 +1717,7 @@ mod tests {
             file_path.to_string_lossy().to_string(),
             None,
             progress,
+            None,
             None,
         )
         .await
