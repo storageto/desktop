@@ -1461,7 +1461,10 @@ pub async fn set_password(file_id: String, is_collection: bool, password: String
     Ok(())
 }
 
-pub async fn set_expiry(file_id: String, is_collection: bool, days: Option<u32>) -> Result<(), String> {
+/// Set a file's or collection's expiry. Returns the `expires_at` the SERVER
+/// applied (None = permanent), which can differ from now + days: the server
+/// caps a free link at a week from upload.
+pub async fn set_expiry(file_id: String, is_collection: bool, days: Option<u32>) -> Result<Option<String>, String> {
     let client = get_client();
     let api_url = get_api_url();
 
@@ -1495,6 +1498,8 @@ pub async fn set_expiry(file_id: String, is_collection: bool, days: Option<u32>)
     struct ApiResponse {
         success: bool,
         error: Option<String>,
+        #[serde(default)]
+        expires_at: Option<String>,
     }
 
     let resp: ApiResponse = response
@@ -1506,7 +1511,7 @@ pub async fn set_expiry(file_id: String, is_collection: bool, days: Option<u32>)
         return Err(resp.error.unwrap_or_else(|| "Unknown error".to_string()));
     }
 
-    Ok(())
+    Ok(resp.expires_at)
 }
 
 pub async fn set_burn_after_reading(file_id: String, is_collection: bool) -> Result<(), String> {
