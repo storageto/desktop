@@ -44,7 +44,13 @@ fn is_cancelled(cancel_flag: &Arc<AtomicBool>) -> bool {
     cancel_flag.load(Ordering::SeqCst)
 }
 
-/// Apply default expiry to an uploaded file/collection (fire and forget)
+fn parse_expiry(s: &Option<String>) -> Option<chrono::DateTime<Utc>> {
+    s.as_ref().and_then(|v| chrono::DateTime::parse_from_rfc3339(v).ok().map(|dt| dt.with_timezone(&Utc)))
+}
+
+/// Apply the default expiry to an uploaded file/collection and record the
+/// expiry the server actually applied. On failure history keeps the expiry
+/// confirm returned, which is what the server holds.
 async fn apply_default_expiry(url: &str, is_collection: bool, days: u32) {
     // Extract file ID from URL (e.g., https://storage.to/abc123 or https://storage.to/c/abc123)
     let file_id = if is_collection {
@@ -59,7 +65,10 @@ async fn apply_default_expiry(url: &str, is_collection: bool, days: u32) {
 
     eprintln!("[Expiry] Applying default expiry of {} days to {}", days, file_id);
     match upload::set_expiry(file_id.to_string(), is_collection, Some(days)).await {
-        Ok(()) => eprintln!("[Expiry] Default expiry applied successfully"),
+        Ok(applied) => {
+            eprintln!("[Expiry] Default expiry applied: {:?}", applied);
+            let _ = storage::set_history_expiry(url, parse_expiry(&applied));
+        }
         Err(e) => eprintln!("[Expiry] Failed to apply default expiry: {}", e),
     }
 }
@@ -88,9 +97,6 @@ async fn upload_single_file(
     if let Some(days) = default_expiry {
         if days > 0 {
             apply_default_expiry(&result.url, false, days).await;
-            // Update local history to reflect the actual expiry
-            let new_expires = Utc::now() + chrono::Duration::days(days as i64);
-            let _ = storage::update_history_item_protection(&result.url, None, None, Some(new_expires));
         }
     }
 
@@ -152,8 +158,6 @@ async fn upload_files(
         if let Some(days) = default_expiry {
             if days > 0 {
                 apply_default_expiry(&result.url, false, days).await;
-                let new_expires = Utc::now() + chrono::Duration::days(days as i64);
-                let _ = storage::update_history_item_protection(&result.url, None, None, Some(new_expires));
             }
         }
 
@@ -169,8 +173,6 @@ async fn upload_files(
             if let Some(last) = results.last() {
                 if last.is_collection {
                     apply_default_expiry(&last.url, true, days).await;
-                    let new_expires = Utc::now() + chrono::Duration::days(days as i64);
-                    let _ = storage::update_history_item_protection(&last.url, None, None, Some(new_expires));
                 }
             }
         }
@@ -1069,8 +1071,6 @@ async fn upload_folder(
     if let Some(days) = default_expiry {
         if days > 0 {
             apply_default_expiry(&result.url, true, days).await;
-            let new_expires = Utc::now() + chrono::Duration::days(days as i64);
-            let _ = storage::update_history_item_protection(&result.url, None, None, Some(new_expires));
         }
     }
 
@@ -1181,8 +1181,10 @@ async fn set_file_password(file_id: String, is_collection: bool, password: Strin
 }
 
 #[tauri::command]
-async fn set_file_expiry(file_id: String, is_collection: bool, days: Option<u32>) -> Result<(), String> {
-    upload::set_expiry(file_id, is_collection, days).await
+async fn set_file_expiry(file_id: String, is_collection: bool, days: Option<u32>, url: String) -> Result<Option<String>, String> {
+    let applied = upload::set_expiry(file_id, is_collection, days).await?;
+    let _ = storage::set_history_expiry(&url, parse_expiry(&applied));
+    Ok(applied)
 }
 
 #[tauri::command]

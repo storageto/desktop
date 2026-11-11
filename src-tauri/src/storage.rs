@@ -232,6 +232,17 @@ pub fn update_history_item_protection(
     save_config(&config)
 }
 
+/// Set a history item's expiry to exactly what the server reported, including
+/// clearing it (None = permanent). update_history_item_protection treats None
+/// as "leave alone", so it cannot record a link becoming permanent.
+pub fn set_history_expiry(url: &str, expires_at: Option<DateTime<Utc>>) -> Result<(), String> {
+    let mut config = load_config();
+    if let Some(item) = config.upload_history.iter_mut().find(|i| i.url == url) {
+        item.expires_at = expires_at;
+    }
+    save_config(&config)
+}
+
 pub fn set_pending_update_version(version: Option<String>) -> Result<(), String> {
     let mut config = load_config();
     config.pending_update_version = version;

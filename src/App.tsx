@@ -651,41 +651,32 @@ function App() {
 
   const handleSetExpiry = async (fileId: string, isCollection: boolean, days: number | null) => {
     const url = getUrlFromFileId(fileId, isCollection);
-    const isPermanent = days === null;
+    const previous = history.find((h) => h.url === url)?.expires_at;
 
-    // Optimistic UI update
-    if (isPermanent) {
+    // Optimistic guess; replaced below by what the server actually applied.
+    if (days === null) {
       updateHistoryItem(url, { expires_at: undefined });
     } else {
-      const expiresAt = new Date();
-      expiresAt.setDate(expiresAt.getDate() + days!);
-      updateHistoryItem(url, { expires_at: expiresAt.toISOString() });
+      const guess = new Date();
+      guess.setDate(guess.getDate() + days);
+      updateHistoryItem(url, { expires_at: guess.toISOString() });
     }
 
     try {
-      await invoke("set_file_expiry", { fileId, isCollection, days });
+      // The command also records the server's expires_at in local history.
+      const applied = await invoke<string | null>("set_file_expiry", { fileId, isCollection, days, url });
+      updateHistoryItem(url, { expires_at: applied ?? undefined });
 
-      const expiresAtStr = isPermanent ? null : (() => {
-        const d = new Date();
-        d.setDate(d.getDate() + days!);
-        return d.toISOString();
-      })();
-
-      await invoke("update_history_protection", {
-        url,
-        passwordProtected: null,
-        burnAfterReading: null,
-        expiresAt: expiresAtStr,
-      });
-
-      addToast({
-        title: "Expiry updated",
-        description: isPermanent ? "File will never expire" : `Expires in ${days} day${days! > 1 ? 's' : ''}`,
-        type: "success",
-      });
+      let description = "File will never expire";
+      if (applied) {
+        const left = Math.max(1, Math.ceil((new Date(applied).getTime() - Date.now()) / 86_400_000));
+        description = `Expires in ${left} day${left > 1 ? "s" : ""}`;
+      }
+      addToast({ title: "Expiry updated", description, type: "success" });
     } catch (err) {
       console.error("Failed to set expiry:", err);
-      updateHistoryItem(url, { expires_at: undefined });
+      // Nothing changed on the server: put back what was there.
+      updateHistoryItem(url, { expires_at: previous });
       addToast({ title: "Failed to set expiry", description: "Please try again", type: "error" });
     }
   };
