@@ -51,8 +51,10 @@ fn parse_expiry(s: &Option<String>) -> Option<chrono::DateTime<Utc>> {
 /// The default expiry to send WITH confirm. 0 means "permanent", which the
 /// server already gives a premium upload when no expiry is sent, so it is not
 /// sent (expiry_days=0 is rejected by the server's min:1 rule anyway).
+/// Clamped to the server's max:3650 so a hand-edited config cannot turn a
+/// working upload into a 422 at confirm.
 fn confirm_expiry(default_expiry: Option<u32>) -> Option<u32> {
-    default_expiry.filter(|d| *d > 0)
+    default_expiry.filter(|d| *d > 0).map(|d| d.min(3650))
 }
 
 /// Record the server's expiry in local history. The server change has already
@@ -2086,6 +2088,7 @@ mod confirm_expiry_tests {
         assert_eq!(confirm_expiry(None), None);
         assert_eq!(confirm_expiry(Some(0)), None);
         assert_eq!(confirm_expiry(Some(7)), Some(7));
+        assert_eq!(confirm_expiry(Some(99_999)), Some(3650));
     }
 }
 
