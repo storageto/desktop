@@ -48,6 +48,25 @@ fn parse_expiry(s: &Option<String>) -> Option<chrono::DateTime<Utc>> {
     s.as_ref().and_then(|v| chrono::DateTime::parse_from_rfc3339(v).ok().map(|dt| dt.with_timezone(&Utc)))
 }
 
+/// The default expiry to send WITH confirm. 0 means "permanent", which the
+/// server already gives a premium upload when no expiry is sent, so it is not
+/// sent (expiry_days=0 is rejected by the server's min:1 rule anyway).
+/// Clamped to the server's max:3650 so a hand-edited config cannot turn a
+/// working upload into a 422 at confirm.
+fn confirm_expiry(default_expiry: Option<u32>) -> Option<u32> {
+    default_expiry.filter(|d| *d > 0).map(|d| d.min(3650))
+}
+
+/// Record the server's expiry in local history. The server change has already
+/// succeeded, so a failed local write must not fail the command, but it must
+/// leave a trace: swallowing it left history showing a stale date silently.
+fn record_history_expiry(url: &str, applied: &Option<String>) {
+    if let Err(e) = storage::set_history_expiry(url, parse_expiry(applied)) {
+        eprintln!("[Expiry] Saved on server but failed to update history for {}: {}", url, e);
+        upload::debug_log(&format!("[Expiry] history update failed for {}: {}", url, e));
+    }
+}
+
 /// Apply the default expiry to an uploaded file/collection and record the
 /// expiry the server actually applied. On failure history keeps the expiry
 /// confirm returned, which is what the server holds.
@@ -67,7 +86,7 @@ async fn apply_default_expiry(url: &str, is_collection: bool, days: u32) {
     match upload::set_expiry(file_id.to_string(), is_collection, Some(days)).await {
         Ok(applied) => {
             eprintln!("[Expiry] Default expiry applied: {:?}", applied);
-            let _ = storage::set_history_expiry(url, parse_expiry(&applied));
+            record_history_expiry(url, &applied);
         }
         Err(e) => eprintln!("[Expiry] Failed to apply default expiry: {}", e),
     }
@@ -91,7 +110,7 @@ async fn upload_single_file(
     // Read default expiry before the await
     let default_expiry = state.config.lock().unwrap().default_expiry_days;
 
-    let result = upload_file(path, None, on_progress, None).await?;
+    let result = upload_file(path, None, on_progress, None, confirm_expiry(default_expiry)).await?;
 
     // Apply default expiry if configured (0 = permanent, skip the call — file is already permanent from confirm)
     if let Some(days) = default_expiry {
@@ -152,7 +171,7 @@ async fn upload_files(
         if is_cancelled(&cancel_flag) {
             return Err("Upload cancelled".to_string());
         }
-        let result = upload_file(paths[0].clone(), None, on_progress, None).await?;
+        let result = upload_file(paths[0].clone(), None, on_progress, None, confirm_expiry(default_expiry)).await?;
 
         // Apply default expiry if configured (0 = permanent, skip)
         if let Some(days) = default_expiry {
@@ -165,7 +184,7 @@ async fn upload_files(
     }
 
     // Multiple files - use batch upload
-    let results = upload_files_batch(paths, on_progress, cancel_flag).await?;
+    let results = upload_files_batch(paths, on_progress, cancel_flag, confirm_expiry(default_expiry)).await?;
 
     // Apply default expiry to the collection if configured (0 = permanent, skip)
     if let Some(days) = default_expiry {
@@ -187,6 +206,7 @@ async fn upload_files_batch(
     paths: Vec<String>,
     on_progress: Channel<UploadProgress>,
     cancel_flag: Arc<AtomicBool>,
+    expiry_days: Option<u32>,
 ) -> Result<Vec<UploadResult>, String> {
     let batch_size = get_batch_size();
 
@@ -490,7 +510,7 @@ async fn upload_files_batch(
 
         // Step 3c: Confirm batch
         if !uploaded_files.is_empty() {
-            let confirm_results = confirm_batch(Some(collection_id.clone()), uploaded_files).await?;
+            let confirm_results = confirm_batch(Some(collection_id.clone()), uploaded_files, expiry_days).await?;
 
             // Process confirm results
             for (idx_str, result) in confirm_results {
@@ -952,7 +972,7 @@ async fn upload_folder(
 
         // Confirm batch
         if !uploaded_files.is_empty() {
-            let confirm_results = confirm_batch(Some(collection_id.clone()), uploaded_files).await?;
+            let confirm_results = confirm_batch(Some(collection_id.clone()), uploaded_files, confirm_expiry(default_expiry)).await?;
 
             for (idx_str, result) in confirm_results {
                 // A file whose bytes reached R2 but whose record was refused
@@ -1183,7 +1203,7 @@ async fn set_file_password(file_id: String, is_collection: bool, password: Strin
 #[tauri::command]
 async fn set_file_expiry(file_id: String, is_collection: bool, days: Option<u32>, url: String) -> Result<Option<String>, String> {
     let applied = upload::set_expiry(file_id, is_collection, days).await?;
-    let _ = storage::set_history_expiry(&url, parse_expiry(&applied));
+    record_history_expiry(&url, &applied);
     Ok(applied)
 }
 
@@ -2057,6 +2077,19 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod confirm_expiry_tests {
+    use super::confirm_expiry;
+
+    #[test]
+    fn zero_and_unset_send_nothing() {
+        assert_eq!(confirm_expiry(None), None);
+        assert_eq!(confirm_expiry(Some(0)), None);
+        assert_eq!(confirm_expiry(Some(7)), Some(7));
+        assert_eq!(confirm_expiry(Some(99_999)), Some(3650));
+    }
 }
 
 #[cfg(test)]
